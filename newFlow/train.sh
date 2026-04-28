@@ -94,6 +94,18 @@ echo "[newflow_train] ========================================"
 echo "[newflow_train] Starting training..."
 echo ""
 
+if [ "${NUM_PROCESSES}" -eq 1 ]; then
+  # 单卡训练
+  python3 train.py \
+    --config "${CONFIG_FILE}" \
+    ${RESUME_FLAG} \
+    ${RESUME_PATH_FLAG} \
+    "$@"
+else
+  # 多卡分布式训练
+  accelerate launch \
+    --num_processes "${NUM_PROCESSES}" \
+    --main_process_port "${MAIN_PORT}" \
 accelerate launch \
   --num_processes "${NUM_PROCESSES}" \
   --main_process_port "${MAIN_PORT}" \
