@@ -1,0 +1,64 @@
+# 快速测试配置 - 使用小数据集和较少步数进行调试
+# 使用方法: accelerate launch train.py --config config/quick_test.yaml
+
+paths:
+  model_name: "flux.2-klein-4b"
+  flux_ckpt: "/data2/luosheng/hf_models/hub/FLUX.2-klein-4B/flux-2-klein-4b.safetensors"
+  ae_ckpt: "/data2/luosheng/hf_models/hub/FLUX.2-klein-4B/ae.safetensors"
+  qwen_ckpt: "/data2/luosheng/hf_models/hub/FLUX.2-klein-4B/tokenizer"  # Tokenizer 路径
+  qwen_model_path: "/data2/luosheng/hf_models/hub/FLUX.2-klein-4B/text_encoder"  # Qwen 模型权重路径
+  elic_ckpt: "/data2/luosheng/code/DiT-IC/checkpoints/elic_official.pth"
+  clip_ckpt: "/data2/luosheng/hf_models/hub/clip-vit-base-patch32"
+  train_root: "/data2/luosheng/code/flux2/datasets/train"
+  val_root: "/data2/luosheng/data/Datasets/clic2024_test_image"
+  output_dir: "./outputs/quick_test"
+
+gpu:
+  cuda_visible_devices: "0"        # 单卡测试
+  mixed_precision: "bf16"
+  main_port: 29500
+
+data:
+  image_size: 256
+  batch_size: 1          # 减小 batch size 以节省显存
+  num_workers: 4
+
+training:
+  max_steps: 1000        # 仅训练 1000 步用于测试
+  lr: 1.0e-5
+  weight_decay: 0.0
+  grad_clip: 1.0
+  seed: 42
+  gradient_accumulation_steps: 1
+  train_schedule_steps: 50
+
+codec:
+  ch_emd: 128
+  channel: 320
+  channel_out: 128
+  num_slices: 5
+
+lora:
+  enabled: true
+  rank: 32
+  alpha: 32.0
+  dropout: 0.0
+  target_regex: ".*"
+
+loss:
+  lambda_rate: 0.5
+  d1_mse: 2.0
+  d2_lpips: 1.0
+  d3_clip: 0.1
+
+logging:
+  use_tensorboard: true
+  log_every: 10          # 更频繁的日志
+  eval_every: 200        # 更频繁的验证
+  save_every: 500        # 更频繁的保存
+  eval_batches: 5        # 减少验证 batch 数量
+  save_log_file: true
+
+resume:
+  enabled: false
+  checkpoint_path: ""

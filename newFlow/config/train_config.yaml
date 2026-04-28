@@ -1,0 +1,77 @@
+# FlowCompression 训练配置文件
+# 使用方法: python train.py --config config/train_config.yaml
+
+# ==================== 路径配置 ====================
+paths:
+  model_name: "flux.2-klein-4b"
+  flux_ckpt: "/data2/luosheng/hf_models/hub/FLUX.2-klein-4B/flux-2-klein-4b.safetensors"
+  ae_ckpt: "/data2/luosheng/hf_models/hub/FLUX.2-klein-4B/ae.safetensors"
+  qwen_ckpt: "/data2/luosheng/hf_models/hub/FLUX.2-klein-4B/tokenizer"  # Tokenizer 路径（use_text_condition=False时不会加载）
+  qwen_model_path: "/data2/luosheng/hf_models/hub/FLUX.2-klein-4B/text_encoder"  # Qwen 模型权重路径
+  elic_ckpt: "/data2/luosheng/code/DiT-IC/checkpoints/elic_official.pth"
+  clip_ckpt: "/data2/luosheng/hf_models/hub/clip-vit-base-patch32"
+  train_root: "/data2/luosheng/code/flux2/datasets/train"
+  val_root: "/data2/luosheng/data/Datasets/Kodak"
+  output_dir: "./outputs/"
+
+# ==================== 模型配置 ====================
+model:
+  use_text_condition: false  # 是否使用文本条件（false则传入空向量，节省显存和计算；true则加载Qwen文本编码器）
+
+# ==================== GPU 配置 ====================
+gpu:
+  cuda_visible_devices: "1"  # 使用的 GPU 设备ID，逗号分隔
+  mixed_precision: "bf16"           # 混合精度类型: "no", "fp16", "bf16"
+  main_port: 29500                  # 分布式训练主端口
+
+# ==================== 数据配置 ====================
+data:
+  image_size: 256
+  batch_size: 2
+  num_workers: 4
+
+# ==================== 训练配置 ====================
+training:
+  max_steps: 200000
+  lr: 1.0e-5
+  weight_decay: 0.0
+  grad_clip: 1.0
+  seed: 42
+  gradient_accumulation_steps: 4
+  train_schedule_steps: 100  # ← 与Flow项目保持一致
+
+# ==================== Codec 配置 ====================
+codec:
+  ch_emd: 128        # Flux AE Main Enc 输出通道
+  channel: 320       # ELIC Aux Enc 输出通道
+  channel_out: 128   # 匹配 Flux AE Latent 通道
+  num_slices: 5
+
+# ==================== LoRA 配置 ====================
+lora:
+  enabled: true
+  rank: 32
+  alpha: 32.0
+  dropout: 0.0
+  target_regex: ".*"  # 正则表达式，匹配所有 Linear 层
+
+# ==================== 损失函数权重 ====================
+loss:
+  lambda_rate: 0.5
+  d1_mse: 1.0
+  d2_lpips: 1.0
+  d3_clip: 0.1
+
+# ==================== 日志与保存 ====================
+logging:
+  use_tensorboard: true
+  log_every: 20          # 每 N 步打印日志
+  eval_every: 500        # 每 N 步验证
+  save_every: 5000       # 每 N 步保存 checkpoint
+  eval_batches: 50       # 验证时使用的 batch 数量
+  save_log_file: true    # 是否保存日志文件
+
+# ==================== 恢复训练 ====================
+resume:
+  enabled: false
+  checkpoint_path: ""    # 如果为空，自动查找最新的 checkpoint
