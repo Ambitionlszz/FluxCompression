@@ -4,7 +4,7 @@ set -euo pipefail
 NUM_PROCESSES=${NUM_PROCESSES:-4}
 MIXED_PRECISION=${MIXED_PRECISION:-bf16}
 MAIN_PORT=${MAIN_PORT:-29500}
-CUDA_DEVICES=${CUDA_DEVICES:-6}
+CUDA_DEVICES=${CUDA_DEVICES:-4}
 
 TRAIN_ROOT=${TRAIN_ROOT:-/data2/luosheng/code/flux2/datasets/train}
 VAL_ROOT=${VAL_ROOT:-/data2/luosheng/data/Datasets/clic2024_test_image}

@@ -6,8 +6,8 @@ paths:
   model_name: "flux.2-klein-4b"
   flux_ckpt: "/data2/luosheng/hf_models/hub/FLUX.2-klein-4B/flux-2-klein-4b.safetensors"
   ae_ckpt: "/data2/luosheng/hf_models/hub/FLUX.2-klein-4B/ae.safetensors"
-  qwen_ckpt: "/data2/luosheng/hf_models/hub/FLUX.2-klein-4B/tokenizer"  # Tokenizer 路径（use_text_condition=False时不会加载）
-  qwen_model_path: "/data2/luosheng/hf_models/hub/FLUX.2-klein-4B/text_encoder"  # Qwen 模型权重路径
+  qwen_ckpt: "/data2/luosheng/hf_models/hub/FLUX.2-klein-4B/tokenizer"        # Qwen tokenizer 路径（始终需要）
+  qwen_model_path: "/data2/luosheng/hf_models/hub/FLUX.2-klein-4B/text_encoder"  # Qwen 模型权重路径（始终需要，缓存后释放）
   elic_ckpt: "/data2/luosheng/code/DiT-IC/checkpoints/elic_official.pth"
   clip_ckpt: "/data2/luosheng/hf_models/hub/clip-vit-base-patch32"
   train_root: "/data2/luosheng/code/flux2/datasets/train"
@@ -15,8 +15,12 @@ paths:
   output_dir: "./outputs/"
 
 # ==================== 模型配置 ====================
+# use_text_condition 控制文本条件内容：
+#   false → 编码空字符串 "" 作为 Flux 条件（节省约 1GB 编码计算，推荐调试用）
+#   true  → 编码固定 prompt "Lossless quality, artifact-free, ..." 作为条件（语义更丰富，推荐正式训练）
+# 注意：两种模式均会在训练开始时加载 Qwen encoder、建立缓存后立即释放，不影响训练显存
 model:
-  use_text_condition: false  # 是否使用文本条件（false则传入空向量，节省显存和计算；true则加载Qwen文本编码器）
+  use_text_condition: true  # ← 改为 false 切换到空文本模式
 
 # ==================== GPU 配置 ====================
 gpu:
@@ -57,8 +61,8 @@ lora:
 
 # ==================== 损失函数权重 ====================
 loss:
-  lambda_rate: 0.5
-  d1_mse: 1.0
+  lambda_rate: 0.4
+  d1_mse: 2.0
   d2_lpips: 1.0
   d3_clip: 0.1
 

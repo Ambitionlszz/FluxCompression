@@ -371,6 +371,12 @@ def main():
     if accelerator.is_main_process:
         print(f"ELIC checkpoint path passed to FlowCompression model.")
     
+    # ⭐ 缓存并卸载文本编码器（省显存）
+    if accelerator.is_main_process:
+        print("\n[Init] Caching text embeddings and unloading text encoder...")
+    model.cache_text_and_free_encoder()
+
+    
     # ==================== 3. LoRA 注入 ====================
     if config['lora']['enabled']:
         if accelerator.is_main_process:
@@ -411,16 +417,22 @@ def main():
     )
     
     # ==================== 6. 优化器 ====================
-    # 只优化 Codec + LoRA 参数（对齐 Flow 项目的单一优化器策略）
-    trainable_params = list(model.codec.parameters())
-    if config['lora']['enabled']:
-        lora_params = [p for n, p in model.flux.named_parameters() if "lora" in n.lower()]
-        trainable_params += lora_params
+    # 只优化 Codec + LoRA + res_scale 参数（对齐 Flow 项目的单一优化器策略）
+    # 使用 named_parameters 确保捕获 model.res_scale, model.codec 和 model.flux(LoRA)
+    trainable_params = [p for n, p in model.named_parameters() if p.requires_grad and not n.endswith(".quantiles")]
     
     optimizer = torch.optim.AdamW(
         trainable_params, 
         lr=config['training']['lr'],
         weight_decay=config['training']['weight_decay']
+    )
+    
+    # ⭐ 关键修复：添加额外的辅优化器，用以单独更新 EntropyBottleneck 参数（quantiles）
+    aux_params = [p for n, p in model.codec.named_parameters() if n.endswith(".quantiles") and p.requires_grad]
+    opt_aux = torch.optim.AdamW(
+        aux_params, 
+        lr=1e-4, 
+        weight_decay=0
     )
     
     if accelerator.is_main_process:
@@ -429,8 +441,8 @@ def main():
         print(f"Total trainable params: {sum(p.numel() for p in trainable_params):,}")
     
     # ==================== 7. Accelerate 准备 ====================
-    model, loss_fn, optimizer, train_loader, val_loader = accelerator.prepare(
-        model, loss_fn, optimizer, train_loader, val_loader
+    model, loss_fn, optimizer, opt_aux, train_loader, val_loader = accelerator.prepare(
+        model, loss_fn, optimizer, opt_aux, train_loader, val_loader
     )
     
     # 设置训练模式
@@ -463,6 +475,9 @@ def main():
             
             # 加载优化器状态
             optimizer.load_state_dict(state["optimizer"])
+            # 加载辅助优化器状态
+            if "opt_aux" in state:
+                opt_aux.load_state_dict(state["opt_aux"])
             global_step = int(state.get("global_step", 0))
             start_epoch = int(state.get("epoch", 0))
             
@@ -501,56 +516,38 @@ def main():
             
             with accelerator.accumulate(model):
                 with accelerator.autocast():
-                    # 使用 ELIC 生成 z_aux（ELIC已集成到模型内部）
+                    # 生成 z_aux（统一通过 _get_z_aux，内部处理 padding 对齐）
                     with torch.no_grad():
-                        if unwrapped_model.elic_aux_encoder is not None:
-                            z_aux = unwrapped_model.elic_aux_encoder(x01)  # (B, 320, H/16, W/16)
-                        else:
-                            # 如果没有ELIC编码器，使用dummy z_aux
-                            z_main, _ = unwrapped_model.encode_images(x01)
-                            z_aux = torch.zeros(
-                                z_main.shape[0], 320, 
-                                z_main.shape[2], z_main.shape[3],
-                                device=z_main.device, dtype=z_main.dtype
-                            )
-                    
-                    # ⭐ 关键诊断：检查z_aux和z_main的维度是否匹配
-                    if global_step < 5 and accelerator.is_main_process:
-                        z_main_debug, pad_info = unwrapped_model.encode_images(x01)
-                        print(f"\n[Step {global_step}] Dimension Check:")
-                        print(f"  Input x01 shape: {x01.shape}")
-                        print(f"  z_main shape (after padding): {z_main_debug.shape}")
-                        print(f"  z_aux shape: {z_aux.shape}")
-                        print(f"  Padding info: pad_h={pad_info['pad_h']}, pad_w={pad_info['pad_w']}")
-                        if z_main_debug.shape[-2:] != z_aux.shape[-2:]:
-                            print(f"  ⚠️ WARNING: Dimension mismatch! z_main={z_main_debug.shape[-2:]}, z_aux={z_aux.shape[-2:]}")
-                        else:
-                            print(f"  ✓ Dimensions match\n")
-                    
+                        _, pad_info_tmp = unwrapped_model.encode_images(x01)
+                        z_aux = unwrapped_model._get_z_aux(x01, pad_info_tmp)
+
                     # 前向传播
                     output = unwrapped_model.forward(
-                        x01, 
-                        z_aux, 
+                        x01,
+                        z_aux,
                         train_schedule_steps=config['training']['train_schedule_steps'],
-                        global_step=global_step  # ← 传递global_step用于调试日志控制
                     )
-                    
+
                     # 计算损失
                     losses = loss_fn(x01, output["x_hat"], output["likelihoods"])
                     total_loss = losses["loss"]
-                    
-                    # ⚠️ 移除KL损失累加，对齐TCMLatent方案
-                    # if "kl_loss" in output and output["kl_loss"] is not None:
-                    #     total_loss = total_loss + 0.05 * output["kl_loss"]
-                    
-                    # ⭐ 诊断：监控likelihoods范围（仅前5步）
-                    if global_step < 5 and accelerator.is_main_process:
+
+                    # 调试日志（前 DEBUG_STEPS 步输出关键 tensor 统计）
+                    DEBUG_STEPS = 5
+                    if global_step < DEBUG_STEPS and accelerator.is_main_process:
                         z_lik = output["likelihoods"]["z"]
                         y_lik = output["likelihoods"]["y"]
-                        print(f"\n[Step {global_step}] Likelihoods stats:")
-                        print(f"  z: min={z_lik.min():.6f}, max={z_lik.max():.6f}, mean={z_lik.mean():.6f}")
-                        print(f"  y: min={y_lik.min():.6f}, max={y_lik.max():.6f}, mean={y_lik.mean():.6f}")
-                        print(f"  BPP: {losses['bpp'].item():.6f}, MSE: {losses['mse'].item():.6f}\n")
+                        z_main_dbg = output["z_clean"]
+                        print(f"\n[DEBUG step={global_step}]")
+                        print(f"  x01      : shape={x01.shape}  range=[{x01.min():.3f}, {x01.max():.3f}]")
+                        print(f"  z_main   : shape={z_main_dbg.shape}  std={z_main_dbg.std():.3f}")
+                        print(f"  z_aux    : shape={z_aux.shape}  std={z_aux.std():.3f}")
+                        if z_main_dbg.shape[-2:] != z_aux.shape[-2:]:
+                            print(f"  ⚠️  SHAPE MISMATCH: z_main={z_main_dbg.shape[-2:]}, z_aux={z_aux.shape[-2:]}")
+                        print(f"  z_tcm    : std={output['z_tcm'].std():.3f}")
+                        print(f"  likelihoods.z: [{z_lik.min():.4f}, {z_lik.max():.4f}] mean={z_lik.mean():.4f}")
+                        print(f"  likelihoods.y: [{y_lik.min():.4f}, {y_lik.max():.4f}] mean={y_lik.mean():.4f}")
+                        print(f"  bpp={losses['bpp'].item():.4f}  mse={losses['mse'].item():.6f}\n")
                 
                 # 反向传播
                 optimizer.zero_grad()
@@ -561,6 +558,12 @@ def main():
                     accelerator.clip_grad_norm_(trainable_params, config['training']['grad_clip'])
                 
                 optimizer.step()
+                
+                # ⭐ 关键修复：计算并反向传播 aux_loss
+                aux_loss = unwrapped_model.codec.aux_loss()
+                opt_aux.zero_grad()
+                accelerator.backward(aux_loss)
+                opt_aux.step()
 
             # 更新统计
             bs = x01.shape[0]
@@ -583,18 +586,11 @@ def main():
                     meter.reset()
                 
                 if accelerator.is_main_process:
-                    # 诊断信息：检查BPP是否异常低
-                    bpp_warning = ""
-                    if log_vals['bpp'] < 0.05:
-                        bpp_warning = " ⚠️  WARNING: BPP异常低，熵模型可能训练失败！"
-                    elif log_vals['bpp'] < 0.1:
-                        bpp_warning = " ⚠️  CAUTION: BPP偏低，请监控熵模型状态"
-                    
                     print(
                         f"[step {global_step}/{config['training']['max_steps']}] "
                         f"loss={log_vals['loss']:.5f} bpp={log_vals['bpp']:.5f} "
                         f"mse={log_vals['mse']:.6f} psnr={log_vals['psnr']:.2f}dB "
-                        f"lpips={log_vals['lpips']:.5f} clip_l2={log_vals['clip_l2']:.5f}"
+                        f"lpips={log_vals['lpips']:.5f} clip={log_vals['clip_l2']:.5f}"
                     )
                     
                     # TensorBoard
@@ -602,6 +598,8 @@ def main():
                         for k, v in log_vals.items():
                             writer.add_scalar(f"train/{k}", v, global_step)
                         writer.add_scalar("train/lr", config['training']['lr'], global_step)
+                        if hasattr(unwrapped_model, 'res_scale'):
+                            writer.add_scalar("train/res_scale", unwrapped_model.res_scale.item(), global_step)
             
             # ==================== 验证评估 ====================
             if global_step % config['logging']['eval_every'] == 0:
@@ -636,6 +634,7 @@ def main():
                     "epoch": current_epoch,
                     "model": accelerator.unwrap_model(model).state_dict(),
                     "optimizer": optimizer.state_dict(),
+                    "opt_aux": opt_aux.state_dict(),
                     "config": config,
                 }
                 
@@ -664,6 +663,7 @@ def main():
             "epoch": current_epoch,
             "model": accelerator.unwrap_model(model).state_dict(),
             "optimizer": optimizer.state_dict(),
+            "opt_aux": opt_aux.state_dict(),
             "config": config,
         }
         

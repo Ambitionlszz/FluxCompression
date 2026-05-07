@@ -126,6 +126,10 @@ class AnalysisTransform(nn.Module):
             nn.Conv2d(320, 64,kernel_size=3,padding=1) # 320ch -> 64ch, 32x32 -> 16x16
         )
 
+        # 新增标准化层：对齐冻结的 VAE 特征和 ELIC 特征的分布，防止量级差异导致特征遮蔽
+        self.norm1 = nn.GroupNorm(32, 128)
+        self.norm2 = nn.GroupNorm(32, 64)
+
         # Modified for 4x downsampling relative to input latent space (16x16 -> 4x4)
         # Using Downsample (stride=2 conv) as per DiT-IC design
         self.analysis_transform = nn.Sequential(
@@ -142,7 +146,13 @@ class AnalysisTransform(nn.Module):
         latent = latent.to(next(self.parameters()).dtype)
         latent2 = latent2.to(next(self.parameters()).dtype)
         
-        x = torch.cat((self.pre1(latent), self.pre2(latent2)), dim=1)
+        # 经过预处理和标准化后再进行拼接
+        #f1 = self.norm1(self.pre1(latent))
+        #f2 = self.norm2(self.pre2(latent2))
+        
+        f1 = self.pre1(latent)
+        f2 = self.pre2(latent2)
+        x = torch.cat((f1, f2), dim=1)
         x = self.analysis_transform(x)
         return x
 
@@ -203,10 +213,11 @@ class AuxDecoder(nn.Module):
             Upsample(320, 320),      # 2nd upsample (2x) -> Total 4x
             nn.Conv2d(320, ch_emd, kernel_size=3, padding=1),
         )
+        
 
     def forward(self, x):
         x = self.block(x)
-        return x
+        return x    
 
 
 class HyperAnalysis(nn.Module):
