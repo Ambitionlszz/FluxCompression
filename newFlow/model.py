@@ -109,9 +109,6 @@ class FlowCompression(nn.Module):
 
         self._prompt_cache = {}
         self._tcm_updated = True
-        
-        # 引入可学习的标量门控，控制 res 的比重，初始为 0，防止 res 分支过早主导导致后验坍塌
-        self.res_scale = nn.Parameter(torch.zeros(1))
 
     # ==================== 构建子模块 ====================
 
@@ -321,11 +318,11 @@ class FlowCompression(nn.Module):
         z_hat_tokens = z_tokens - timesteps.view(-1, 1, 1) * v_pred_tokens
         z_hat = self._tokens_to_latent(z_hat_tokens, z_ids)
 
-        # 5. 辅助残差叠加（参考 DiT-IC 实现，使用可学习的 res_scale 门控）
+        # 5. 辅助残差叠加
         if res is not None:
             if res.shape[-2:] != z_hat.shape[-2:]:
                 res = F.interpolate(res, size=z_hat.shape[-2:], mode='bilinear', align_corners=False)
-            z_hat = z_hat + self.res_scale * res.to(z_hat.dtype)
+            z_hat = z_hat + res.to(z_hat.dtype)
 
         # 6. VAE 解码（使用普通 clamp，对齐 Flow 的实现）
         x_hat01 = self.decode_latents(z_hat, pad_info)
@@ -412,7 +409,7 @@ class FlowCompression(nn.Module):
         # 5. 辅助残差叠加
         if res_batch.shape[-2:] != z_out.shape[-2:]:
             res_batch = F.interpolate(res_batch, size=z_out.shape[-2:], mode='bilinear', align_corners=False)
-        z_out = z_out + self.res_scale * res_batch.to(z_out.dtype)
+        z_out = z_out + res_batch.to(z_out.dtype)
 
         # 6. VAE 解码
         x_hat01 = self.decode_latents(z_out, pad_info)
@@ -426,7 +423,6 @@ class FlowCompression(nn.Module):
             print(f"  z_aux     : range=[{z_aux.min():.3f}, {z_aux.max():.3f}]  std={z_aux.std():.3f}")
             print(f"  z_tcm     : range=[{z_tcm.min():.3f}, {z_tcm.max():.3f}]  std={z_tcm.std():.3f}")
             print(f"  res_batch : range=[{res_batch.min():.3f}, {res_batch.max():.3f}]  mean={res_batch.mean():.3f}")
-            print(f"  res_scale : {self.res_scale.item():.6f}")
             print(f"  z_out     : range=[{z_out.min():.3f}, {z_out.max():.3f}]  std={z_out.std():.3f}")
             print(f"  x_hat01   : range=[{x_hat01.min():.3f}, {x_hat01.max():.3f}]  mean={x_hat01.mean():.3f}")
             print(f"  bytes     : {total_bytes}")

@@ -417,8 +417,8 @@ def main():
     )
     
     # ==================== 6. 优化器 ====================
-    # 只优化 Codec + LoRA + res_scale 参数（对齐 Flow 项目的单一优化器策略）
-    # 使用 named_parameters 确保捕获 model.res_scale, model.codec 和 model.flux(LoRA)
+    # 只优化 Codec + LoRA 参数（对齐 Flow 项目的单一优化器策略）
+    # 使用 named_parameters 确保捕获 model.codec 和 model.flux(LoRA)
     trainable_params = [p for n, p in model.named_parameters() if p.requires_grad and not n.endswith(".quantiles")]
     
     optimizer = torch.optim.AdamW(
@@ -598,8 +598,6 @@ def main():
                         for k, v in log_vals.items():
                             writer.add_scalar(f"train/{k}", v, global_step)
                         writer.add_scalar("train/lr", config['training']['lr'], global_step)
-                        if hasattr(unwrapped_model, 'res_scale'):
-                            writer.add_scalar("train/res_scale", unwrapped_model.res_scale.item(), global_step)
             
             # ==================== 验证评估 ====================
             if global_step % config['logging']['eval_every'] == 0:

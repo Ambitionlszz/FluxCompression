@@ -70,8 +70,8 @@ loss:
 logging:
   use_tensorboard: true
   log_every: 20          # 每 N 步打印日志
-  eval_every: 500        # 每 N 步验证
-  save_every: 5000       # 每 N 步保存 checkpoint
+  eval_every: 2000        # 每 N 步验证
+  save_every: 20000       # 每 N 步保存 checkpoint
   eval_batches: 50       # 验证时使用的 batch 数量
   save_log_file: true    # 是否保存日志文件
 

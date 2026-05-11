@@ -192,7 +192,7 @@ class SynthesisTransform2(nn.Module):
             DepthConvBlock(192, 192),
             Upsample(192, 192),      # 2nd upsample (2x) -> Total 4x
             nn.Conv2d(192, channel_out, kernel_size=3, padding=1),
-        )
+        )   
 
     def forward(self, x):
         x = self.synthesis_transform(x)
