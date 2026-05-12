@@ -121,19 +121,15 @@ class FlowCompression(nn.Module):
         )
 
     def _load_elic_aux_encoder(self, elic_ckpt: str):
-        from .elic_aux_encoder import ELICAuxEncoder
-        self.elic_aux_encoder = ELICAuxEncoder(N=192, M=320)
+        from .elic_aux_encoder import load_elic_encoder
         if os.path.exists(elic_ckpt):
-            checkpoint = torch.load(elic_ckpt, map_location="cpu")
-            if "g_a" in checkpoint:
-                g_a_state = {k.replace("g_a.", ""): v for k, v in checkpoint.items() if k.startswith("g_a.")}
-                self.elic_aux_encoder.load_state_dict(g_a_state, strict=False)
-            else:
-                self.elic_aux_encoder.load_state_dict(checkpoint, strict=False)
+            self.elic_aux_encoder = load_elic_encoder(elic_ckpt, device=self.device, N=192, M=320)
             print(f"[FlowCompression] ELIC aux encoder loaded from: {elic_ckpt}")
         else:
+            from .elic_aux_encoder import ELICAuxEncoder
+            self.elic_aux_encoder = ELICAuxEncoder(N=192, M=320)
+            self.elic_aux_encoder.to(self.device)
             print(f"[FlowCompression] WARNING: ELIC ckpt not found at {elic_ckpt}, using random init")
-        self.elic_aux_encoder.to(self.device)
         self.elic_aux_encoder.eval()
         for p in self.elic_aux_encoder.parameters():
             p.requires_grad = False
@@ -299,6 +295,7 @@ class FlowCompression(nn.Module):
 
         # 3. Flux 去噪
         z_tokens, z_ids = self._latent_to_tokens(z_tcm)
+        
         schedule = get_schedule(train_schedule_steps, z_tokens.shape[1])
         schedule_tensor = torch.tensor(schedule, dtype=z_tokens.dtype, device=device)
         step_idx = torch.randint(0, train_schedule_steps, (batch_size,), device=device)

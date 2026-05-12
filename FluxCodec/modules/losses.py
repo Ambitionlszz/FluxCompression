@@ -71,6 +71,7 @@ class Stage1Loss(nn.Module):
 
         bpp = self._bpp_loss(likelihoods, num_pixels)
         mse = F.mse_loss(x_hat01, x01)
+        psnr = -10 * torch.log10(torch.clamp(mse, min=1e-8))
         x_lpips = x01 * 2.0 - 1.0
         x_hat_lpips = x_hat01 * 2.0 - 1.0
         lpips_loss = self.lpips(x_hat_lpips, x_lpips).mean()
@@ -82,6 +83,7 @@ class Stage1Loss(nn.Module):
             "loss": total,
             "bpp": bpp.detach(),
             "mse": mse.detach(),
+            "psnr": psnr.detach(),
             "lpips": lpips_loss.detach(),
             "clip_l2": clip_l2.detach(),
         }

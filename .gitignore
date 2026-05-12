@@ -305,3 +305,5 @@ diffusers_cache/
 Flow/outputs/
 newFlow/outputs/
 diffusers/
+
+outputs/

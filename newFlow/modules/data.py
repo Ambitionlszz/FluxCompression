@@ -8,11 +8,12 @@ import random
 from pathlib import Path
 from typing import Iterable
 
-from PIL import Image
+from PIL import Image,ImageFile
 import torch
 from torch.utils.data import DataLoader, Dataset
 from torchvision import transforms
 
+ImageFile.LOAD_TRUNCATED_IMAGES = True
 IMAGE_EXTENSIONS = {".png", ".jpg", ".jpeg", ".bmp", ".tiff", ".webp"}
 
 

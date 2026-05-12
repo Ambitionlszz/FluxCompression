@@ -95,10 +95,12 @@ class AnalysisTransform(nn.Module):
     FLUX AE (16ch, H/16) 和 ELIC (320ch, H/16) 空间尺寸相同，
     直接 concat 后用一个 Conv 融合通道，然后做 4x 下采样到 H/64。
     """
-    def __init__(self, ch_emd=128, channel=320):
+    def __init__(self, ch_emd=128, channel=320, use_aux_encoder=True):
         super().__init__()
+        self.use_aux_encoder = use_aux_encoder
         # FLUX AE 16x 和 ELIC 16x 空间尺寸一致，直接 concat + conv 融合
-        self.fuse = nn.Conv2d(ch_emd + 320, 192, kernel_size=3, padding=1)  # 128+320=448 → 192
+        in_channels = ch_emd + 320 if use_aux_encoder else ch_emd
+        self.fuse = nn.Conv2d(in_channels, 192, kernel_size=3, padding=1)  # 融合通道
 
         self.analysis_transform = nn.Sequential(
             DepthConvBlock(192, 192),
@@ -109,12 +111,15 @@ class AnalysisTransform(nn.Module):
             DepthConvBlock(channel, channel),
         )
 
-    def forward(self, latent, latent2):
+    def forward(self, latent, latent2=None):
         """
         latent:  FLUX AE 输出 (B, 16, H/16, W/16)
         latent2: ELIC 辅助编码器输出 (B, 320, H/16, W/16)
         """
-        x = torch.cat((latent, latent2), dim=1)
+        if self.use_aux_encoder and latent2 is not None:
+            x = torch.cat((latent, latent2), dim=1)
+        else:
+            x = latent
         x = self.fuse(x)
         x = self.analysis_transform(x)
         return x
@@ -224,19 +229,25 @@ class LRP(nn.Module):
 
 class LatentCodec(nn.Module):
     def __init__(self, ch_emd=128, channel=320, channel_out=128,
-                 num_slices=5, max_support_slices=5, **kwargs):
+                 num_slices=5, max_support_slices=5, 
+                 use_aux_encoder=True, use_aux_decoder=True, **kwargs):
         super().__init__()
 
         M = channel
         self.M = channel
         self.num_slices = num_slices
         self.max_support_slices = max_support_slices
+        self.use_aux_encoder = use_aux_encoder
+        self.use_aux_decoder = use_aux_decoder
 
-        self.g_a = AnalysisTransform(ch_emd, channel)
+        self.g_a = AnalysisTransform(ch_emd, channel, use_aux_encoder)
         self.g_s = SynthesisTransform(channel, channel_out)
         self.h_a = HyperAnalysis(channel)
         self.h_s = HyperSynthesis(channel)
-        self.aux = AuxDecoder(ch_emd, channel)
+        if self.use_aux_decoder:
+            self.aux = AuxDecoder(ch_emd, channel)
+        else:
+            self.aux = None
 
         context_dim = M * 2
         self.adapter_in = nn.ModuleList(
@@ -253,9 +264,10 @@ class LatentCodec(nn.Module):
 
         self.apply(self._init_weights)
 
-        # Zero-init aux decoder's final conv to prevent shortcut domination
-        nn.init.constant_(self.aux.block[-1].weight, 0)
-        nn.init.constant_(self.aux.block[-1].bias, 0)
+        if self.use_aux_decoder:
+            # Zero-init aux decoder's final conv to prevent shortcut domination
+            nn.init.constant_(self.aux.block[-1].weight, 0)
+            nn.init.constant_(self.aux.block[-1].bias, 0)
 
     def _init_weights(self, m):
         if isinstance(m, nn.Linear):
@@ -349,7 +361,7 @@ class LatentCodec(nn.Module):
 
     # ---- Forward / Compress / Decompress ----
 
-    def forward(self, latent, latent2):
+    def forward(self, latent, latent2=None):
         y = self.g_a(latent, latent2)
         z = self.h_a(y)
 
@@ -388,7 +400,7 @@ class LatentCodec(nn.Module):
         y_likelihoods = y_lk_0 + y_lk_1 + y_lk_2 + y_lk_3
 
         x_hat = self.g_s(y_hat)
-        res = self.aux(y_hat)
+        res = self.aux(y_hat) if self.use_aux_decoder else None
 
         return {
             "x_hat": x_hat,
@@ -396,7 +408,7 @@ class LatentCodec(nn.Module):
             "likelihoods": {"y": y_likelihoods, "z": z_likelihoods},
         }
 
-    def compress(self, latent, latent2):
+    def compress(self, latent, latent2=None):
         y = self.g_a(latent, latent2)
         z = self.h_a(y)
 
@@ -488,6 +500,6 @@ class LatentCodec(nn.Module):
         torch.backends.cudnn.deterministic = False
 
         x_hat = self.g_s(y_hat)
-        res = self.aux(y_hat)
+        res = self.aux(y_hat) if self.use_aux_decoder else None
 
         return {"x_hat": x_hat, "res": res}

@@ -90,6 +90,10 @@ def parse_args():
     parser.add_argument("--codec_num_slices", type=int, default=5)
     parser.add_argument("--codec_ckpt", type=str, default="", help="Pretrained codec checkpoint")
 
+    # 辅助编码器/解码器开关
+    parser.add_argument("--use_aux_encoder", type=int, default=1, help="1 to enable ELIC aux encoder, 0 to disable")
+    parser.add_argument("--use_aux_decoder", type=int, default=1, help="1 to enable AuxDecoder residual, 0 to disable")
+
     # 日志/评估/保存
     parser.add_argument("--log_every", type=int, default=20)
     parser.add_argument("--eval_every", type=int, default=500)
@@ -106,6 +110,8 @@ def build_codec(args):
         channel=args.codec_channel,
         channel_out=args.codec_channel_out,
         num_slices=args.codec_num_slices,
+        use_aux_encoder=bool(args.use_aux_encoder),
+        use_aux_decoder=bool(args.use_aux_decoder),
     )
 
 
@@ -182,7 +188,7 @@ def main():
 
     # ELIC 辅助编码器
     elic_aux = None
-    if args.elic_ckpt:
+    if args.elic_ckpt and args.use_aux_encoder:
         elic_aux = load_elic_encoder(args.elic_ckpt, device=accelerator.device)
 
     pipeline = FluxCodecPipeline(
@@ -265,7 +271,7 @@ def main():
         print(f"LoRA trainable params: {lora_stats.trainable_params}")
         print(f"Codec trainable params: {total_codec}")
 
-    meters = {k: AverageMeter() for k in ["loss", "bpp", "mse", "lpips", "clip_l2"]}
+    meters = {k: AverageMeter() for k in ["loss", "bpp", "mse", "psnr", "lpips", "clip_l2"]}
 
     stop = False
     current_epoch = start_epoch
@@ -302,7 +308,8 @@ def main():
                     print(
                         f"[step {global_step}] "
                         f"loss={log_vals['loss']:.5f} bpp={log_vals['bpp']:.5f} "
-                        f"mse={log_vals['mse']:.6f} lpips={log_vals['lpips']:.5f} clip_l2={log_vals['clip_l2']:.5f}"
+                        f"psnr={log_vals['psnr']:.2f} mse={log_vals['mse']:.6f} "
+                        f"lpips={log_vals['lpips']:.5f} clip_l2={log_vals['clip_l2']:.5f}"
                     )
                     if args.use_tensorboard:
                         for k, v in log_vals.items():
@@ -320,7 +327,8 @@ def main():
                     print(
                         f"[eval {global_step}] "
                         f"loss={metrics['loss']:.5f} bpp={metrics['bpp']:.5f} "
-                        f"mse={metrics['mse']:.6f} lpips={metrics['lpips']:.5f} clip_l2={metrics['clip_l2']:.5f}"
+                        f"psnr={metrics['psnr']:.2f} mse={metrics['mse']:.6f} "
+                        f"lpips={metrics['lpips']:.5f} clip_l2={metrics['clip_l2']:.5f}"
                     )
                     if args.use_tensorboard:
                         for k, v in metrics.items():

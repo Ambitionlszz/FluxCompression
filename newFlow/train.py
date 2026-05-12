@@ -419,7 +419,7 @@ def main():
     # ==================== 6. 优化器 ====================
     # 只优化 Codec + LoRA 参数（对齐 Flow 项目的单一优化器策略）
     # 使用 named_parameters 确保捕获 model.codec 和 model.flux(LoRA)
-    trainable_params = [p for n, p in model.named_parameters() if p.requires_grad and not n.endswith(".quantiles")]
+    trainable_params = [p for n, p in model.named_parameters() if p.requires_grad and not n.endswith("quantiles")]
     
     optimizer = torch.optim.AdamW(
         trainable_params, 
@@ -428,7 +428,7 @@ def main():
     )
     
     # ⭐ 关键修复：添加额外的辅优化器，用以单独更新 EntropyBottleneck 参数（quantiles）
-    aux_params = [p for n, p in model.codec.named_parameters() if n.endswith(".quantiles") and p.requires_grad]
+    aux_params = [p for n, p in model.codec.named_parameters() if n.endswith("quantiles") and p.requires_grad]
     opt_aux = torch.optim.AdamW(
         aux_params, 
         lr=1e-4, 
@@ -465,7 +465,29 @@ def main():
             state = torch.load(resume_ckpt, map_location="cpu")
             
             # 加载模型状态
-            accelerator.unwrap_model(model).load_state_dict(state["model"], strict=False)
+            load_info = accelerator.unwrap_model(model).load_state_dict(state["model"], strict=False)
+            if accelerator.is_main_process:
+                print(f"\n{'='*50}")
+                print(f"[Model Resume Audit] State dict loaded with strict=False:")
+                if len(load_info.missing_keys) > 0:
+                    print(f"  ⚠️ MISSING KEYS ({len(load_info.missing_keys)}):")
+                    # Display first 20 missing keys to avoid overwhelming the log
+                    for mk in load_info.missing_keys[:20]:
+                        print(f"    - {mk}")
+                    if len(load_info.missing_keys) > 20:
+                        print(f"    - ... and {len(load_info.missing_keys) - 20} more missing keys.")
+                else:
+                    print(f"  ✓ SUCCESS: All model parameters matched perfectly! No missing keys.")
+                
+                if len(load_info.unexpected_keys) > 0:
+                    print(f"  ⚠️ UNEXPECTED KEYS ({len(load_info.unexpected_keys)}):")
+                    for uk in load_info.unexpected_keys[:20]:
+                        print(f"    - {uk}")
+                    if len(load_info.unexpected_keys) > 20:
+                        print(f"    - ... and {len(load_info.unexpected_keys) - 20} more unexpected keys.")
+                else:
+                    print(f"  ✓ No unexpected keys found in resume checkpoint.")
+                print(f"{'='*50}\n")
             
             # 加载 LoRA 状态
             if config['lora']['enabled'] and "flux_lora" in state:

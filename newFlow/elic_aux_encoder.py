@@ -163,7 +163,27 @@ def load_elic_encoder(elic_ckpt_path: str, device: torch.device, N: int = 192, M
         new_state_dict[new_key] = v
     
     # 加载状态字典
-    model.load_state_dict(new_state_dict, strict=False)
+    load_info = model.load_state_dict(new_state_dict, strict=False)
+    
+    print(f"\n{'='*50}")
+    print(f"[ELIC Weight Audit] Loading weights from {elic_ckpt_path}:")
+    if len(load_info.missing_keys) > 0:
+        print(f"  ⚠️ MISSING KEYS ({len(load_info.missing_keys)}):")
+        for mk in load_info.missing_keys:
+            print(f"    - {mk}")
+    else:
+        print(f"  ✓ SUCCESS: All model parameters loaded perfectly! No missing keys.")
+        
+    if len(load_info.unexpected_keys) > 0:
+        print(f"  ⚠️ UNEXPECTED KEYS ({len(load_info.unexpected_keys)}):")
+        for uk in load_info.unexpected_keys[:10]:
+            print(f"    - {uk}")
+        if len(load_info.unexpected_keys) > 10:
+            print(f"    - ... and {len(load_info.unexpected_keys) - 10} more unexpected keys.")
+    else:
+        print(f"  ✓ No unexpected keys found in checkpoint.")
+    print(f"{'='*50}\n")
+    
     model = model.to(device)
     model.eval()
     

@@ -74,6 +74,7 @@ class Stage1Evaluator:
             "loss": AverageMeter(),
             "bpp": AverageMeter(),
             "mse": AverageMeter(),
+            "psnr": AverageMeter(),
             "lpips": AverageMeter(),
             "clip_l2": AverageMeter(),
         }
@@ -149,6 +150,7 @@ class Stage1Evaluator:
         
         # 计算其他质量指标
         mse = F.mse_loss(out["x_hat"], batch)
+        psnr = -10 * torch.log10(torch.clamp(mse, min=1e-8))
         lpips_loss = self._lpips_metric(out["x_hat"] * 2.0 - 1.0, batch * 2.0 - 1.0).mean()
         clip_l2 = self._clip_metric(batch, out["x_hat"])
         
@@ -160,6 +162,7 @@ class Stage1Evaluator:
             "loss": loss,
             "bpp": bpp,
             "mse": mse,
+            "psnr": psnr,
             "lpips": lpips_loss,
             "clip_l2": clip_l2,
         }

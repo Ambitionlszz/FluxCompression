@@ -41,8 +41,8 @@ training:
   weight_decay: 0.0
   grad_clip: 1.0
   seed: 42
-  gradient_accumulation_steps: 4
-  train_schedule_steps: 100  # ← 与Flow项目保持一致
+  gradient_accumulation_steps: 2
+  train_schedule_steps: 1000  
 
 # ==================== Codec 配置 ====================
 codec:
@@ -61,7 +61,7 @@ lora:
 
 # ==================== 损失函数权重 ====================
 loss:
-  lambda_rate: 0.4
+  lambda_rate: 0.08
   d1_mse: 2.0
   d2_lpips: 1.0
   d3_clip: 0.1
