@@ -2,7 +2,7 @@
 # FluxCodec Stage1 训练启动脚本
 
 # ===== 设置使用的 GPU =====
-GPU_ID=1        # 单卡: 0, 1, 2, ... 多卡: 0,1
+GPU_ID=1      # 单卡: 0, 1, 2, ... 多卡: 0,1
 
 export CUDA_VISIBLE_DEVICES=$GPU_ID
 
@@ -25,9 +25,9 @@ accelerate launch \
     --max_steps 400000 \
     --lr 1e-5 \
     --grad_clip 1.0 \
-    --train_schedule_steps 1000 \
+    --train_schedule_steps 100 \
     --guidance 1.0 \
-    --lambda_rate 0.3 \
+    --lambda_rate 0.5 \
     --d1_mse 2.0 \
     --d2_lpips 1.0 \
     --d3_clip 0.1 \
@@ -37,8 +37,8 @@ accelerate launch \
     --codec_channel 320 \
     --codec_channel_out 128 \
     --codec_num_slices 5 \
-    --use_aux_encoder 0 \
-    --use_aux_decoder 0 \
+    --use_aux_encoder 1 \
+    --use_aux_decoder 1 \
     --log_every 20 \
     --eval_every 2000 \
     --save_every 20000 \

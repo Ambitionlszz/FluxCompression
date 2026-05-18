@@ -272,7 +272,7 @@ class FluxCodecPipeline(nn.Module):
                 z_bytes = sum(len(s) for s in comp["strings"][1])
                 total_bytes.append(float(y_bytes + z_bytes))
             z_tcm = torch.cat(z_tcm_list, dim=0)
-            res_batch = torch.cat(res_list, dim=0)
+            res_batch = torch.cat(res_list, dim=0) if res_list[0] is not None else None
         else:
             codec_out = self.codec(z_clean, z_aux)
             z_tcm = codec_out["x_hat"]

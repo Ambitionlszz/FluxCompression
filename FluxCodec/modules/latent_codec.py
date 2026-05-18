@@ -105,9 +105,8 @@ class AnalysisTransform(nn.Module):
         self.analysis_transform = nn.Sequential(
             DepthConvBlock(192, 192),
             DepthConvBlock(192, 192),
-            Downsample(192, 320),          # 2x down
-            DepthConvBlock(320, 320),
-            Downsample(320, channel),      # 2x down → 总 4x
+            Downsample(192, channel),      # 1x down -> (16x16 -> 8x8)
+            DepthConvBlock(channel, channel),
             DepthConvBlock(channel, channel),
         )
 
@@ -132,9 +131,8 @@ class SynthesisTransform(nn.Module):
         self.synthesis_transform = nn.Sequential(
             DepthConvBlock(channel, 320),
             DepthConvBlock(320, 320),
-            Upsample(320, 320),            # 2x up
+            Upsample(320, 320),            # 1x up -> (8x8 -> 16x16)
             DepthConvBlock(320, 320),
-            Upsample(320, 320),            # 2x up → 总 4x
             nn.Conv2d(320, channel_out, kernel_size=3, padding=1),
         )
 
@@ -149,9 +147,8 @@ class AuxDecoder(nn.Module):
         self.block = nn.Sequential(
             DepthConvBlock(channel, 320),
             DepthConvBlock(320, 320),
-            Upsample(320, 320),            # 2x up
+            Upsample(320, 320),            # 1x up -> (8x8 -> 16x16)
             DepthConvBlock(320, 320),
-            Upsample(320, 320),            # 2x up → 总 4x
             nn.Conv2d(320, ch_emd, kernel_size=3, padding=1),
         )
 

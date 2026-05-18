@@ -228,15 +228,29 @@ def main():
     )
 
     # 可训练参数: codec + flux LoRA
-    trainable_params = [p for p in pipeline.codec.parameters() if p.requires_grad]
-    trainable_params += [p for p in pipeline.flux.parameters() if p.requires_grad]
+    # 分离 aux_parameters 以用于单独的辅助优化器（用于熵模型 CDF 估计）
+    codec_params = [p for n, p in pipeline.codec.named_parameters() if not n.endswith("quantiles") and p.requires_grad]
+    aux_params = [p for n, p in pipeline.codec.named_parameters() if n.endswith("quantiles") and p.requires_grad]
+    flux_params = [p for p in pipeline.flux.parameters() if p.requires_grad]
 
+    trainable_params = codec_params + flux_params
     optimizer = torch.optim.AdamW(trainable_params, lr=args.lr, weight_decay=args.weight_decay)
+    
+    aux_optimizer = None
+    if aux_params:
+        aux_optimizer = torch.optim.AdamW(aux_params, lr=1e-5, weight_decay=0.0)
 
     # Accelerate prepare
-    pipeline.codec, pipeline.flux, criterion, optimizer, train_loader, val_loader = accelerator.prepare(
-        pipeline.codec, pipeline.flux, criterion, optimizer, train_loader, val_loader,
-    )
+    if aux_optimizer is not None:
+        prepared = accelerator.prepare(
+            pipeline.codec, pipeline.flux, criterion, optimizer, aux_optimizer, train_loader, val_loader,
+        )
+        pipeline.codec, pipeline.flux, criterion, optimizer, aux_optimizer, train_loader, val_loader = prepared
+    else:
+        prepared = accelerator.prepare(
+            pipeline.codec, pipeline.flux, criterion, optimizer, train_loader, val_loader,
+        )
+        pipeline.codec, pipeline.flux, criterion, optimizer, train_loader, val_loader = prepared
 
     pipeline.flux.train()
     pipeline.codec.train()
@@ -260,6 +274,8 @@ def main():
                 if accelerator.is_main_process and missing:
                     print(f"[resume] missing LoRA modules: {len(missing)}")
                 optimizer.load_state_dict(state["optimizer"])
+                if "aux_optimizer" in state and aux_optimizer is not None:
+                    aux_optimizer.load_state_dict(state["aux_optimizer"])
                 global_step = int(state.get("global_step", 0))
                 start_epoch = int(state.get("epoch", 0))
 
@@ -290,6 +306,13 @@ def main():
                     params += [p for p in pipeline.codec.parameters() if p.requires_grad]
                     accelerator.clip_grad_norm_(params, args.grad_clip)
                 optimizer.step()
+
+                # 优化辅助损失 (熵瓶颈 CDF 估计)
+                if aux_optimizer is not None:
+                    aux_loss = accelerator.unwrap_model(pipeline.codec).aux_loss()
+                    aux_optimizer.zero_grad()
+                    accelerator.backward(aux_loss)
+                    aux_optimizer.step()
 
             bs = batch.shape[0]
             for k in meters:
@@ -341,6 +364,7 @@ def main():
                     "codec": accelerator.unwrap_model(pipeline.codec).state_dict(),
                     "flux_lora": lora_state_dict(accelerator.unwrap_model(pipeline.flux)),
                     "optimizer": optimizer.state_dict(),
+                    "aux_optimizer": aux_optimizer.state_dict() if aux_optimizer is not None else None,
                     "args": vars(args),
                 }
                 ckpt_path = os.path.join(ckpt_dir, f"stage1_step_{global_step:08d}.pt")
@@ -362,6 +386,7 @@ def main():
             "codec": accelerator.unwrap_model(pipeline.codec).state_dict(),
             "flux_lora": lora_state_dict(accelerator.unwrap_model(pipeline.flux)),
             "optimizer": optimizer.state_dict(),
+            "aux_optimizer": aux_optimizer.state_dict() if aux_optimizer is not None else None,
             "args": vars(args),
         }
         save_checkpoint(final_path, state)
