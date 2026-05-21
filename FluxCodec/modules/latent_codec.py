@@ -1,11 +1,5 @@
 """
-FluxCodec LatentCodec - 基于 DiT-IC 设计，适配 FLUX AE (16x downsample)。
-
-关键改动（相对 DiT-IC）：
-- FLUX AE 16x = ELIC 16x，所以 concat 后只需一个 Conv 融合
-- g_a 多下采样 2x（总 4x），使得像素域总下采样 = 16x * 4x = 64x
-- g_s 多上采样 2x（总 4x）
-- AuxDecoder 多上采样 2x（总 4x）
+FluxCodec LatentCodec - Based on DiT-IC, adapted for FLUX AE (16x downsample).
 """
 import math
 
@@ -91,16 +85,21 @@ class Upsample(nn.Module):
 
 class AnalysisTransform(nn.Module):
     """
-    g_a: 4x 下采样。
-    FLUX AE (16ch, H/16) 和 ELIC (320ch, H/16) 空间尺寸相同，
-    直接 concat 后用一个 Conv 融合通道，然后做 4x 下采样到 H/64。
+    g_a: 4x downsampling analysis transform.
     """
     def __init__(self, ch_emd=128, channel=320, use_aux_encoder=True):
         super().__init__()
         self.use_aux_encoder = use_aux_encoder
-        # FLUX AE 16x 和 ELIC 16x 空间尺寸一致，直接 concat + conv 融合
-        in_channels = ch_emd + 320 if use_aux_encoder else ch_emd
-        self.fuse = nn.Conv2d(in_channels, 192, kernel_size=3, padding=1)  # 融合通道
+        
+        # Channel reduction: project 320d ELIC features to 64d to prevent BPP explosion
+        if self.use_aux_encoder:
+            self.aux_proj = nn.Conv2d(320, 64, kernel_size=3, padding=1)
+            in_channels = ch_emd + 64
+        else:
+            self.aux_proj = None
+            in_channels = ch_emd
+            
+        self.fuse = nn.Conv2d(in_channels, 192, kernel_size=3, padding=1)  # channel fusion
 
         self.analysis_transform = nn.Sequential(
             DepthConvBlock(192, 192),
@@ -112,11 +111,12 @@ class AnalysisTransform(nn.Module):
 
     def forward(self, latent, latent2=None):
         """
-        latent:  FLUX AE 输出 (B, 16, H/16, W/16)
+        latent:  FLUX AE 输出 (B, 128, H/16, W/16)
         latent2: ELIC 辅助编码器输出 (B, 320, H/16, W/16)
         """
         if self.use_aux_encoder and latent2 is not None:
-            x = torch.cat((latent, latent2), dim=1)
+            latent2_proj = self.aux_proj(latent2)
+            x = torch.cat((latent, latent2_proj), dim=1)
         else:
             x = latent
         x = self.fuse(x)
@@ -125,7 +125,7 @@ class AnalysisTransform(nn.Module):
 
 
 class SynthesisTransform(nn.Module):
-    """g_s: 4x 上采样（比 DiT-IC 多一层 Upsample）。"""
+    """g_s: 4x upsampling transform."""
     def __init__(self, channel=320, channel_out=128):
         super().__init__()
         self.synthesis_transform = nn.Sequential(
@@ -141,7 +141,7 @@ class SynthesisTransform(nn.Module):
 
 
 class AuxDecoder(nn.Module):
-    """辅助解码器: 4x 上采样（比 DiT-IC 多一层 Upsample）。"""
+    """Auxiliary decoder with 4x upsampling."""
     def __init__(self, ch_emd=128, channel=320):
         super().__init__()
         self.block = nn.Sequential(
@@ -297,7 +297,7 @@ class LatentCodec(nn.Module):
         update_registered_buffers(
             self.gaussian_conditional, "gaussian_conditional",
             ["_quantized_cdf", "_offset", "_cdf_length", "scale_table"], state_dict)
-        super().load_state_dict(state_dict, strict=strict)
+        return super().load_state_dict(state_dict, strict=strict)
 
     # ---- Mask utilities (identical to DiT-IC) ----
 
@@ -356,9 +356,40 @@ class LatentCodec(nn.Module):
         latent_sq_hat = torch.Tensor(latent_sq_hat).reshape(scales_sq.shape).to(scales.device)
         return self.unsequeeze_with_mask(latent_sq_hat + means_sq, mask)
 
+    def _target_latent_size(self, size):
+        # g_a maps latent size L to ceil(L / 2). h_a/h_s then require that
+        # y size to be divisible by 4 so the hyperprior returns the same size.
+        for target in range(size, size + 8):
+            if ((target + 1) // 2) % 4 == 0:
+                return target
+        raise RuntimeError(f"Could not find aligned latent size for {size}")
+
+    def _pad_latents_for_hyperprior(self, latent, latent2=None):
+        h, w = latent.shape[-2:]
+        target_h = self._target_latent_size(h)
+        target_w = self._target_latent_size(w)
+        pad_h = target_h - h
+        pad_w = target_w - w
+        pad_info = {"latent_shape": (h, w), "pad_h": pad_h, "pad_w": pad_w}
+        if pad_h == 0 and pad_w == 0:
+            return latent, latent2, pad_info
+
+        pad = (0, pad_w, 0, pad_h)
+        latent = F.pad(latent, pad, mode="replicate")
+        if latent2 is not None:
+            latent2 = F.pad(latent2, pad, mode="replicate")
+        return latent, latent2, pad_info
+
+    def _crop_to_latent_shape(self, tensor, pad_info):
+        if tensor is None or pad_info is None:
+            return tensor
+        h, w = pad_info["latent_shape"]
+        return tensor[..., :h, :w]
+
     # ---- Forward / Compress / Decompress ----
 
     def forward(self, latent, latent2=None):
+        latent, latent2, pad_info = self._pad_latents_for_hyperprior(latent, latent2)
         y = self.g_a(latent, latent2)
         z = self.h_a(y)
 
@@ -366,38 +397,50 @@ class LatentCodec(nn.Module):
         z_offset = self.entropy_bottleneck._get_medians()
         z_hat = ste_round(z - z_offset) + z_offset
 
+        # Sequentially decode the 4 checkerboard subsets (Stage 0 to Stage 3)
+        # to implement spatial context model (ELIC style)
         B, C, H, W = y.shape
         mask_0, mask_1, mask_2, mask_3 = self.get_mask_four_parts(B, C, H, W, device=y.device)
 
         base = self.h_s(z_hat)
+        
+        # Stage 0: Decode subset 0 using hyperprior context
         means_0, scales_0 = self.adapter_out[0](self.g_c(self.adapter_in[0](base))).chunk(2, 1)
         y_hat_0, y_lk_0 = self.forward_with_mask(y, scales_0, means_0, mask_0)
+        # Local Residual Prediction (LRP) to refine the reconstructed latent representation
         lrp = 0.5 * torch.tanh(self.LRP[0](torch.cat([y_hat_0, base], dim=1)) * mask_0)
         y_hat_0 = y_hat_0 + lrp
 
+        # Stage 1: Update context with subset 0's reconstruction, then decode subset 1
         base = base * (1 - mask_0) + y_hat_0
         means_1, scales_1 = self.adapter_out[1](self.g_c(self.adapter_in[1](base))).chunk(2, 1)
         y_hat_1, y_lk_1 = self.forward_with_mask(y, scales_1, means_1, mask_1)
         lrp = 0.5 * torch.tanh(self.LRP[1](torch.cat([y_hat_1, base], dim=1)) * mask_1)
         y_hat_1 = y_hat_1 + lrp
 
+        # Stage 2: Update context with subset 1's reconstruction, then decode subset 2
         base = base * (1 - mask_1) + y_hat_1
         means_2, scales_2 = self.adapter_out[2](self.g_c(self.adapter_in[2](base))).chunk(2, 1)
         y_hat_2, y_lk_2 = self.forward_with_mask(y, scales_2, means_2, mask_2)
         lrp = 0.5 * torch.tanh(self.LRP[2](torch.cat([y_hat_2, base], dim=1)) * mask_2)
         y_hat_2 = y_hat_2 + lrp
 
+        # Stage 3: Update context with subset 2's reconstruction, then decode subset 3
         base = base * (1 - mask_2) + y_hat_2
         means_3, scales_3 = self.adapter_out[3](self.g_c(self.adapter_in[3](base))).chunk(2, 1)
         y_hat_3, y_lk_3 = self.forward_with_mask(y, scales_3, means_3, mask_3)
         lrp = 0.5 * torch.tanh(self.LRP[3](torch.cat([y_hat_3, base], dim=1)) * mask_3)
         y_hat_3 = y_hat_3 + lrp
 
+        # Merge all checkerboard parts and sum up likelihoods
         y_hat = y_hat_0 + y_hat_1 + y_hat_2 + y_hat_3
         y_likelihoods = y_lk_0 + y_lk_1 + y_lk_2 + y_lk_3
 
+        # Synthesis and decoding
         x_hat = self.g_s(y_hat)
         res = self.aux(y_hat) if self.use_aux_decoder else None
+        x_hat = self._crop_to_latent_shape(x_hat, pad_info)
+        res = self._crop_to_latent_shape(res, pad_info)
 
         return {
             "x_hat": x_hat,
@@ -406,6 +449,7 @@ class LatentCodec(nn.Module):
         }
 
     def compress(self, latent, latent2=None):
+        latent, latent2, pad_info = self._pad_latents_for_hyperprior(latent, latent2)
         y = self.g_a(latent, latent2)
         z = self.h_a(y)
 
@@ -419,44 +463,64 @@ class LatentCodec(nn.Module):
         encoder = BufferedRansEncoder()
         symbols_list, indexes_list, y_strings = [], [], []
 
+        # Sequentially encode the 4 checkerboard subsets (Stage 0 to Stage 3)
+        # to ensure the same autoregressive spatial context is available at decoder side
         B, C, H, W = y.shape
         mask_0, mask_1, mask_2, mask_3 = self.get_mask_four_parts(B, C, H, W, device=y.device)
 
         base = self.h_s(z_hat)
+        
+        # Stage 0: Encode subset 0
         means_0, scales_0 = self.adapter_out[0](self.g_c(self.adapter_in[0](base))).chunk(2, 1)
         y_hat_0 = self.compress_group_with_mask(self.gaussian_conditional, y, scales_0, means_0, mask_0, symbols_list, indexes_list)
         lrp = 0.5 * torch.tanh(self.LRP[0](torch.cat([y_hat_0, base], dim=1)) * mask_0)
         y_hat_0 = y_hat_0 + lrp
 
+        # Stage 1: Update context with subset 0's reconstruction, then encode subset 1
         base = base * (1 - mask_0) + y_hat_0
         means_1, scales_1 = self.adapter_out[1](self.g_c(self.adapter_in[1](base))).chunk(2, 1)
         y_hat_1 = self.compress_group_with_mask(self.gaussian_conditional, y, scales_1, means_1, mask_1, symbols_list, indexes_list)
         lrp = 0.5 * torch.tanh(self.LRP[1](torch.cat([y_hat_1, base], dim=1)) * mask_1)
         y_hat_1 = y_hat_1 + lrp
 
+        # Stage 2: Update context with subset 1's reconstruction, then encode subset 2
         base = base * (1 - mask_1) + y_hat_1
         means_2, scales_2 = self.adapter_out[2](self.g_c(self.adapter_in[2](base))).chunk(2, 1)
         y_hat_2 = self.compress_group_with_mask(self.gaussian_conditional, y, scales_2, means_2, mask_2, symbols_list, indexes_list)
         lrp = 0.5 * torch.tanh(self.LRP[2](torch.cat([y_hat_2, base], dim=1)) * mask_2)
         y_hat_2 = y_hat_2 + lrp
 
+        # Stage 3: Update context with subset 2's reconstruction, then encode subset 3
         base = base * (1 - mask_2) + y_hat_2
         means_3, scales_3 = self.adapter_out[3](self.g_c(self.adapter_in[3](base))).chunk(2, 1)
         y_hat_3 = self.compress_group_with_mask(self.gaussian_conditional, y, scales_3, means_3, mask_3, symbols_list, indexes_list)
         lrp = 0.5 * torch.tanh(self.LRP[3](torch.cat([y_hat_3, base], dim=1)) * mask_3)
         y_hat_3 = y_hat_3 + lrp
 
+        # Entropy coding of all subsets
         encoder.encode_with_indexes(symbols_list, indexes_list, cdf, cdf_lengths, offsets)
         y_strings.append(encoder.flush())
         torch.backends.cudnn.deterministic = False
 
-        return {"strings": [y_strings, z_strings], "shape": z.size()[-2:]}
+        return {
+            "strings": [y_strings, z_strings],
+            "shape": {
+                "z_shape": z.size()[-2:],
+                "latent_shape": pad_info["latent_shape"],
+            },
+        }
 
     def decompress(self, strings, shape):
         torch.backends.cudnn.deterministic = True
         y_strings = strings[0][0]
         z_strings = strings[1]
-        z_hat = self.entropy_bottleneck.decompress(z_strings, shape)
+        if isinstance(shape, dict):
+            z_shape = shape["z_shape"]
+            pad_info = {"latent_shape": tuple(shape["latent_shape"])}
+        else:
+            z_shape = shape
+            pad_info = None
+        z_hat = self.entropy_bottleneck.decompress(z_strings, z_shape)
 
         cdf = self.gaussian_conditional.quantized_cdf.tolist()
         cdf_lengths = self.gaussian_conditional.cdf_length.reshape(-1).int().tolist()
@@ -465,38 +529,47 @@ class LatentCodec(nn.Module):
         decoder.set_stream(y_strings)
 
         B, C, H, W = z_hat.shape
-        # h_a 做了 4x 下采样，所以 y 的空间尺寸是 z 的 4 倍
+        # h_a has 4x downsampling, so y spatial size is 4x of z
         mask_0, mask_1, mask_2, mask_3 = self.get_mask_four_parts(
             B, C * 2, H * 4, W * 4, device=z_hat.device)
 
         base = self.h_s(z_hat)
+        
+        # Stage 0: Decompress subset 0 using hyperprior context
         means_0, scales_0 = self.adapter_out[0](self.g_c(self.adapter_in[0](base))).chunk(2, 1)
         y_hat_0 = self.decompress_group_with_mask(self.gaussian_conditional, scales_0, means_0, mask_0, decoder, cdf, cdf_lengths, offsets)
         lrp = 0.5 * torch.tanh(self.LRP[0](torch.cat([y_hat_0, base], dim=1)) * mask_0)
         y_hat_0 = y_hat_0 + lrp
 
+        # Stage 1: Update context with subset 0's reconstruction, then decompress subset 1
         base = base * (1 - mask_0) + y_hat_0
         means_1, scales_1 = self.adapter_out[1](self.g_c(self.adapter_in[1](base))).chunk(2, 1)
         y_hat_1 = self.decompress_group_with_mask(self.gaussian_conditional, scales_1, means_1, mask_1, decoder, cdf, cdf_lengths, offsets)
         lrp = 0.5 * torch.tanh(self.LRP[1](torch.cat([y_hat_1, base], dim=1)) * mask_1)
         y_hat_1 = y_hat_1 + lrp
 
+        # Stage 2: Update context with subset 1's reconstruction, then decompress subset 2
         base = base * (1 - mask_1) + y_hat_1
         means_2, scales_2 = self.adapter_out[2](self.g_c(self.adapter_in[2](base))).chunk(2, 1)
         y_hat_2 = self.decompress_group_with_mask(self.gaussian_conditional, scales_2, means_2, mask_2, decoder, cdf, cdf_lengths, offsets)
         lrp = 0.5 * torch.tanh(self.LRP[2](torch.cat([y_hat_2, base], dim=1)) * mask_2)
         y_hat_2 = y_hat_2 + lrp
 
+        # Stage 3: Update context with subset 2's reconstruction, then decompress subset 3
         base = base * (1 - mask_2) + y_hat_2
         means_3, scales_3 = self.adapter_out[3](self.g_c(self.adapter_in[3](base))).chunk(2, 1)
         y_hat_3 = self.decompress_group_with_mask(self.gaussian_conditional, scales_3, means_3, mask_3, decoder, cdf, cdf_lengths, offsets)
         lrp = 0.5 * torch.tanh(self.LRP[3](torch.cat([y_hat_3, base], dim=1)) * mask_3)
         y_hat_3 = y_hat_3 + lrp
 
+        # Merge checkerboard parts
         y_hat = y_hat_0 + y_hat_1 + y_hat_2 + y_hat_3
         torch.backends.cudnn.deterministic = False
 
+        # Synthesis and decoding
         x_hat = self.g_s(y_hat)
         res = self.aux(y_hat) if self.use_aux_decoder else None
+        x_hat = self._crop_to_latent_shape(x_hat, pad_info)
+        res = self._crop_to_latent_shape(res, pad_info)
 
         return {"x_hat": x_hat, "res": res}

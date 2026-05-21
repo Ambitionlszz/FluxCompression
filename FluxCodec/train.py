@@ -1,6 +1,5 @@
 """
-FluxCodec Stage1 训练脚本 - 基于 Flow/flux_tcm_stage1_train.py 改造。
-将 TCM 替换为 DiT-IC 风格的 LatentCodec + ELIC 辅助编码器。
+FluxCodec Stage1 Training Script.
 """
 import argparse
 import glob
@@ -20,14 +19,14 @@ if str(REPO_ROOT) not in sys.path:
     sys.path.insert(0, str(REPO_ROOT))
 if str(REPO_ROOT / "src") not in sys.path:
     sys.path.insert(0, str(REPO_ROOT / "src"))
-# 确保当前脚本所在目录也在路径中（支持 modules.xxx 导入）
+# Support import from modules.xxx
 if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from modules.latent_codec import LatentCodec
 from modules.data import (
     RecursiveImageDataset, build_dataloader,
-    build_train_transform, build_val_transform,
+    build_train_transform, build_val_transform, build_eval_transform,
 )
 from modules.lora import inject_lora, load_lora_state_dict, lora_state_dict
 from modules.losses import Stage1Loss
@@ -52,7 +51,6 @@ def parse_args():
     parser.add_argument("--flux_ckpt", type=str, default="/data2/luosheng/hf_models/hub/FLUX.2-klein-4B/flux-2-klein-4b.safetensors")
     parser.add_argument("--ae_ckpt", type=str, default="/data2/luosheng/hf_models/hub/FLUX.2-klein-4B/ae.safetensors")
     parser.add_argument("--qwen_ckpt", type=str, default="/data2/luosheng/hf_models/hub/Qwen3-4B-FP8")
-    parser.add_argument("--clip_ckpt", type=str, default="/data2/luosheng/hf_models/hub/clip-vit-base-patch32")
     parser.add_argument("--elic_ckpt", type=str, default="/data2/luosheng/code/DiT-IC/checkpoints/elic_official.pth", help="Path to pretrained ELIC checkpoint")
 
     parser.add_argument("--image_size", type=int, default=256)
@@ -71,11 +69,11 @@ def parse_args():
     parser.add_argument("--train_schedule_steps", type=int, default=100)
     parser.add_argument("--guidance", type=float, default=1.0)
 
-    # 损失权重
+    # Loss weights
     parser.add_argument("--lambda_rate", type=float, default=0.5)
     parser.add_argument("--d1_mse", type=float, default=2.0)
     parser.add_argument("--d2_lpips", type=float, default=1.0)
-    parser.add_argument("--d3_clip", type=float, default=0.1)
+    parser.add_argument("--d3_dists", type=float, default=1.0)
 
     # LoRA
     parser.add_argument("--lora_rank", type=int, default=32)
@@ -90,16 +88,18 @@ def parse_args():
     parser.add_argument("--codec_num_slices", type=int, default=5)
     parser.add_argument("--codec_ckpt", type=str, default="", help="Pretrained codec checkpoint")
 
-    # 辅助编码器/解码器开关
+    # Aux encoder/decoder flags
     parser.add_argument("--use_aux_encoder", type=int, default=1, help="1 to enable ELIC aux encoder, 0 to disable")
     parser.add_argument("--use_aux_decoder", type=int, default=1, help="1 to enable AuxDecoder residual, 0 to disable")
 
-    # 日志/评估/保存
+    # Logging/Evaluation/Saving
     parser.add_argument("--log_every", type=int, default=20)
-    parser.add_argument("--eval_every", type=int, default=500)
+    parser.add_argument("--eval_every", type=int, default=5000)
     parser.add_argument("--save_every", type=int, default=5000)
-    parser.add_argument("--eval_batches", type=int, default=50)
+    parser.add_argument("--eval_batches", type=int, default=24)
+    parser.add_argument("--eval_center_crop", action="store_true", help="Use 256 crop eval instead of full-image inference-style eval")
     parser.add_argument("--resume", action="store_true", default=False)
+    parser.add_argument("--resume_ckpt", type=str, default="", help="Explicit Stage1 checkpoint to resume from")
 
     return parser.parse_args()
 
@@ -113,6 +113,11 @@ def build_codec(args):
         use_aux_encoder=bool(args.use_aux_encoder),
         use_aux_decoder=bool(args.use_aux_decoder),
     )
+
+
+def find_latest_checkpoint(output_dir: str, pattern: str) -> str | None:
+    ckpts = sorted(glob.glob(os.path.join(output_dir, "run_*", "checkpoints", pattern)))
+    return ckpts[-1] if ckpts else None
 
 
 def main():
@@ -173,20 +178,22 @@ def main():
 
     set_seed(args.seed)
 
-    # 数据
+    # Datasets and Dataloaders
     train_dataset = RecursiveImageDataset(args.train_root, transform=build_train_transform(args.image_size))
-    val_dataset = RecursiveImageDataset(args.val_root, transform=build_val_transform(args.image_size))
+    val_transform = build_val_transform(args.image_size) if args.eval_center_crop else build_eval_transform()
+    val_batch_size = args.batch_size if args.eval_center_crop else 1
+    val_dataset = RecursiveImageDataset(args.val_root, transform=val_transform)
     train_loader = build_dataloader(train_dataset, args.batch_size, args.num_workers, shuffle=True, drop_last=True)
-    val_loader = build_dataloader(val_dataset, args.batch_size, args.num_workers, shuffle=False, drop_last=False)
+    val_loader = build_dataloader(val_dataset, val_batch_size, args.num_workers, shuffle=False, drop_last=False)
 
-    # 模型
+    # Model
     codec = build_codec(args)
     if args.codec_ckpt:
         ckpt = torch.load(args.codec_ckpt, map_location="cpu")
         state = ckpt.get("state_dict", ckpt)
         codec.load_state_dict(state, strict=False)
 
-    # ELIC 辅助编码器
+    # ELIC Auxiliary Encoder
     elic_aux = None
     if args.elic_ckpt and args.use_aux_encoder:
         elic_aux = load_elic_encoder(args.elic_ckpt, device=accelerator.device)
@@ -211,24 +218,23 @@ def main():
         target_regex=args.lora_target_regex,
     )
 
-    # 损失函数
+    # Loss Function
     criterion = Stage1Loss(
-        clip_path=args.clip_ckpt,
         lambda_rate=args.lambda_rate,
         d1_mse=args.d1_mse,
         d2_lpips=args.d2_lpips,
-        d3_clip=args.d3_clip,
+        d3_dists=args.d3_dists,
     )
 
-    # 评估器
+    # Evaluator
     evaluator = Stage1Evaluator(
         accelerator=accelerator,
         output_dir=run_dir if run_dir else args.output_dir,
         eval_batches=args.eval_batches,
     )
 
-    # 可训练参数: codec + flux LoRA
-    # 分离 aux_parameters 以用于单独的辅助优化器（用于熵模型 CDF 估计）
+    # Trainable parameters: codec + FLUX LoRA
+    # Separate aux_parameters for separate auxiliary optimizer (entropy CDF estimation)
     codec_params = [p for n, p in pipeline.codec.named_parameters() if not n.endswith("quantiles") and p.requires_grad]
     aux_params = [p for n, p in pipeline.codec.named_parameters() if n.endswith("quantiles") and p.requires_grad]
     flux_params = [p for p in pipeline.flux.parameters() if p.requires_grad]
@@ -260,34 +266,33 @@ def main():
 
     # Resume
     if args.resume:
-        all_runs = sorted(glob.glob(os.path.join(args.output_dir, "run_*")))
-        if all_runs:
-            latest_run = all_runs[-1]
-            ckpts = sorted(glob.glob(os.path.join(latest_run, "checkpoints", "stage1_step_*.pt")))
-            if ckpts:
-                latest_ckpt = ckpts[-1]
-                if accelerator.is_main_process:
-                    print(f"Resuming from checkpoint: {latest_ckpt}")
-                state = torch.load(latest_ckpt, map_location="cpu")
-                accelerator.unwrap_model(pipeline.codec).load_state_dict(state["codec"], strict=True)
-                missing = load_lora_state_dict(accelerator.unwrap_model(pipeline.flux), state["flux_lora"])
-                if accelerator.is_main_process and missing:
-                    print(f"[resume] missing LoRA modules: {len(missing)}")
-                optimizer.load_state_dict(state["optimizer"])
-                if "aux_optimizer" in state and aux_optimizer is not None:
-                    aux_optimizer.load_state_dict(state["aux_optimizer"])
-                global_step = int(state.get("global_step", 0))
-                start_epoch = int(state.get("epoch", 0))
+        latest_ckpt = args.resume_ckpt or find_latest_checkpoint(args.output_dir, "stage1_step_*.pt")
+        if latest_ckpt:
+            if accelerator.is_main_process:
+                print(f"Resuming from checkpoint: {latest_ckpt}")
+            state = torch.load(latest_ckpt, map_location="cpu")
+            accelerator.unwrap_model(pipeline.codec).load_state_dict(state["codec"], strict=True)
+            missing = load_lora_state_dict(accelerator.unwrap_model(pipeline.flux), state["flux_lora"])
+            if accelerator.is_main_process and missing:
+                print(f"[resume] missing LoRA modules: {len(missing)}")
+            optimizer.load_state_dict(state["optimizer"])
+            if "aux_optimizer" in state and aux_optimizer is not None:
+                aux_optimizer.load_state_dict(state["aux_optimizer"])
+            global_step = int(state.get("global_step", 0))
+            start_epoch = int(state.get("epoch", 0))
+        elif accelerator.is_main_process:
+            print(f"[resume] No Stage1 checkpoint found under {args.output_dir}")
 
     if accelerator.is_main_process:
         total_codec = sum(p.numel() for p in accelerator.unwrap_model(pipeline.codec).parameters() if p.requires_grad)
         print(f"Train images: {len(train_dataset)}")
         print(f"Val images: {len(val_dataset)}")
+        print(f"Eval mode: {'center crop' if args.eval_center_crop else 'full image'} (batch_size={val_batch_size})")
         print(f"LoRA injected layers: {lora_stats.injected_layers}")
         print(f"LoRA trainable params: {lora_stats.trainable_params}")
         print(f"Codec trainable params: {total_codec}")
 
-    meters = {k: AverageMeter() for k in ["loss", "bpp", "mse", "psnr", "lpips", "clip_l2"]}
+    meters = {k: AverageMeter() for k in ["loss", "bpp", "mse", "psnr", "lpips", "dists"]}
 
     stop = False
     current_epoch = start_epoch
@@ -307,7 +312,7 @@ def main():
                     accelerator.clip_grad_norm_(params, args.grad_clip)
                 optimizer.step()
 
-                # 优化辅助损失 (熵瓶颈 CDF 估计)
+                # Optimize auxiliary loss (entropy bottleneck CDF estimation)
                 if aux_optimizer is not None:
                     aux_loss = accelerator.unwrap_model(pipeline.codec).aux_loss()
                     aux_optimizer.zero_grad()
@@ -332,7 +337,7 @@ def main():
                         f"[step {global_step}] "
                         f"loss={log_vals['loss']:.5f} bpp={log_vals['bpp']:.5f} "
                         f"psnr={log_vals['psnr']:.2f} mse={log_vals['mse']:.6f} "
-                        f"lpips={log_vals['lpips']:.5f} clip_l2={log_vals['clip_l2']:.5f}"
+                        f"lpips={log_vals['lpips']:.5f} dists={log_vals['dists']:.5f}"
                     )
                     if args.use_tensorboard:
                         for k, v in log_vals.items():
@@ -344,14 +349,13 @@ def main():
                     criterion=criterion,
                     val_loader=val_loader,
                     global_step=global_step,
-                    clip_ckpt=args.clip_ckpt,
                 )
                 if accelerator.is_main_process:
                     print(
                         f"[eval {global_step}] "
                         f"loss={metrics['loss']:.5f} bpp={metrics['bpp']:.5f} "
                         f"psnr={metrics['psnr']:.2f} mse={metrics['mse']:.6f} "
-                        f"lpips={metrics['lpips']:.5f} clip_l2={metrics['clip_l2']:.5f}"
+                        f"lpips={metrics['lpips']:.5f} dists={metrics['dists']:.5f}"
                     )
                     if args.use_tensorboard:
                         for k, v in metrics.items():
@@ -395,6 +399,10 @@ def main():
         if args.use_tensorboard and writer:
             writer.close()
         if log_file_handle:
+            tee_logger = sys.stdout
+            if hasattr(tee_logger, "original_stdout"):
+                sys.stdout = tee_logger.original_stdout
+                sys.stderr = tee_logger.original_stdout
             log_file_handle.close()
 
 

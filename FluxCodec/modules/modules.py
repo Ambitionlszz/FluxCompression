@@ -1,5 +1,5 @@
 """
-基础模块 - 复用自 DiT-IC/Block 的 DepthConvBlock 等。
+Basic blocks - Reused from DiT-IC/Block.
 """
 import torch
 import torch.nn as nn

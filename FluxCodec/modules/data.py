@@ -82,6 +82,10 @@ def build_val_transform(image_size: int):
     )
 
 
+def build_eval_transform():
+    return transforms.ToTensor()
+
+
 def seed_worker(worker_id: int):
     worker_seed = torch.initial_seed() % 2**32
     random.seed(worker_seed)

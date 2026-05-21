@@ -1,160 +1,227 @@
-# FLUX.2
+# FluxCompression
 
-**Frontier Visual Intelligence** — State-of-the-art image generation and editing from [Black Forest Labs](https://bfl.ai).
+FluxCompression is a research codebase for image compression experiments built around
+FLUX.2 Klein, learned latent compression, LoRA adaptation, and GAN/perceptual
+fine-tuning. The repository keeps the original FLUX.2 inference code under `src/`,
+then adds compression-oriented training and inference pipelines in `Flow/`,
+`FluxCodec/`, `LIC_TCM/`, `DiT-IC/`, and `StableCodec/`.
 
----
+The current main workflow is:
 
-<p align="center">
-<a href="https://docs.bfl.ai">API Docs</a> •
-<a href="https://huggingface.co/black-forest-labs">Hugging Face</a> •
-<a href="https://bfl.ai/blog">Blog</a>
-</p>
+1. Train a Stage 1 rate-distortion model with FLUX.2 Klein + TCM/latent codec.
+2. Run compression inference and export reconstructions plus metrics.
+3. Optionally fine-tune Stage 2 with perceptual and adversarial losses.
 
-This repo contains minimal inference code to run image generation & editing with our FLUX.2 open-weight models.
+## Repository Layout
 
-## News
+| Path | Purpose |
+| --- | --- |
+| `src/flux2/` | FLUX.2 model, autoencoder, sampling, and text encoder code. |
+| `Flow/` | Stage 1 FLUX + TCM training/inference pipeline. |
+| `FluxCodec/` | Newer FluxCodec training, inference, Stage 2 GAN fine-tuning, and tuning scripts. |
+| `LIC_TCM/` | TCM and learned image compression modules. |
+| `DiT-IC/` | DiT-IC reference code and ELIC components/checkpoint utilities. |
+| `StableCodec/` | StableCodec reference implementation used by the GAN fine-tuning design. |
+| `docs/` | Project notes, including Stage 2 GAN training design. |
+| `scripts/` | Upstream FLUX.2 interactive CLI. |
 
-- **[15.01.2026]** Today, we release the FLUX.2 [klein] family of models, our fastest models yet. Sub-second generation on consumer GPUs. Read more about it in our [blog post](https://bfl.ai/blog/flux2-klein-towards-interactive-visual-intelligence).
-- **[25.11.2025]** We are releasing FLUX.2 [dev], a 32B parameter model for text-to-image generation, and image editing (single reference image and multiple reference images).
+## Environment
 
-## Model Overview
+The project is Python-based and expects CUDA-capable PyTorch for practical use.
+The checked-in `pyproject.toml` targets Python `>=3.10,<3.13`.
 
-| Name | Step-distilled | Guidance-distilled | Text-to-Image | Image Editing (Single reference) | Image Editing (Multi-reference) | License |
-| :--- | :---: | :---: | :---: | :---: | :---: | :---: |
-| [FLUX.2 [klein] 4B](https://huggingface.co/black-forest-labs/FLUX.2-klein-4B) | ✅ | ✅ | ✅ | ✅ | ✅ | [apache-2.0](https://huggingface.co/datasets/choosealicense/licenses/blob/main/markdown/apache-2.0.md) |
-| [FLUX.2 [klein] 9B](https://huggingface.co/black-forest-labs/FLUX.2-klein-9B) | ✅ | ✅ | ✅ | ✅ | ✅ | [FLUX Non-Commercial License](model_licenses/LICENSE-FLUX-NON-COMMERICAL) |
-| [FLUX.2 [klein] 4B Base](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-4B) | ❌ | ❌ | ✅ | ✅ | ✅ | [apache-2.0](https://huggingface.co/datasets/choosealicense/licenses/blob/main/markdown/apache-2.0.md) |
-| [FLUX.2 [klein] 9B Base](https://huggingface.co/black-forest-labs/FLUX.2-klein-base-9B) | ❌ | ❌ | ✅ | ✅ | ✅ | [FLUX Non-Commercial License](model_licenses/LICENSE-FLUX-NON-COMMERICAL) |
-| [FLUX.2 [dev]](https://huggingface.co/black-forest-labs/FLUX.2-dev) | ❌ | ✅ | ✅ | ✅ | ✅ | [FLUX.2-dev Non-Commercial License](model_licenses/LICENSE-FLUX-DEV) |
-
-**All models support**: Text-to-Image ✅ | Single-ref Editing ✅ | Multi-ref Editing ✅
-
-## Which Model Should I Use?
-
-| Need | Recommended |
-|------|-------------|
-| Real-time apps, interactive workflows | [klein] 4B or 9B (distilled) |
-| Consumer GPU (e.g. RTX 3090/4070) | [klein] 4B |
-| Fine-tuning, LoRA training | [klein] Base or FLUX.2 [dev] |
-| Maximum quality, no latency constraints | FLUX.2 [dev] |
-
-## `FLUX.2 [klein]`
-
-FLUX.2 [klein] is our fastest model family — generating and editing (multiple) images in under a second without sacrificing quality. Built for real-time applications, creative iteration, and deployment on consumer hardware.
-
-### Key Capabilities
-- **Sub-second inference** — Generate or edit images under a second on modern hardware
-- **Unified generation & editing** — Text-to-image, image editing, and multi-reference in one model
-- **Runs on consumer GPUs** — Klein 4B fits in ~8GB VRAM (RTX 3090/4070 and up)
-- **Apache 2.0 on 4B** — Open-source, fine-tuning, and customization
-
-### Performance
-
-Klein models define the Pareto frontier for quality vs. latency and VRAM across text-to-image, single-reference editing, and multi-reference generation:
-
-<p align="center">
-<img src="assets/klein_benchmark.jpg" alt="FLUX.2 [klein] vs Baselines — Elo vs Latency and VRAM" width="800"/>
-</p>
-<sub>Higher Elo + Lower Latency/VRAM = Better.</sub>
-
-### The Klein Family
-
-| Model | Best For |
-|:---|:---|
-| **[klein] 4B** | Maximum speed, consumer hardware, edge deployment |
-| **[klein] 9B** | Best quality-to-latency ratio, production apps |
-| **[klein] 4B Base** | Fine-tuning on limited hardware, full customization |
-| **[klein] 9B Base** | Research, LoRA training, maximum output diversity |
-
-**Distilled vs Base:**
-- Use **Distilled** (4-step) for production apps and real-time generation
-- Use **Base** (50-step) for fine-tuning, LoRA training, and maximum flexibility
-
-**Licensing:** 4B models are [Apache 2.0](https://huggingface.co/datasets/choosealicense/licenses/blob/main/markdown/apache-2.0.md). 9B models use the [FLUX.2-dev Non-Commercial License](model_licenses/LICENSE-FLUX-DEV).
-
-### Text-to-image examples
-
-Example focused on realism 
-![t2i-klein-grid](assets/t2i_klein_realism.jpg)
-
-Example focused on output diversity
-![t2i-klein-others](assets/t2i_klein_others.jpg)
-
-### Editing examples
-
-![i2i-klein](assets/i2i_klein.jpg)
-
-## `FLUX.2 [dev]`
-
-`FLUX.2 [dev]` is a 32B parameter flow matching transformer model capable of generating and editing (multiple) images. The model is released under the [FLUX.2-dev Non-Commercial License](model_licenses/LICENSE-FLUX-DEV) and can be found [here](https://huggingface.co/black-forest-labs/FLUX.2-dev).
-
-Note that the below script for `FLUX.2 [dev]` needs considerable amount of VRAM (H100-equivalent GPU). We partnered with Hugging Face to make quantized versions that run on consumer hardware; below you can find instructions on how to run it on a RTX 4090 with a remote text encoder, for other quantization sizes and combinations, check the [diffusers quantization guide here](docs/flux2_dev_hf.md).
-
-### Text-to-image examples
-
-![t2i-grid](assets/teaser_generation.png)
-
-### Editing examples
-
-![edit-grid](assets/teaser_editing.png)
-
-### Prompt upsampling
-
-`FLUX.2 [dev]` benefits significantly from prompt upsampling. The inference script below offers the option to use both local prompt upsampling with the same model we use for text encoding ([`Mistral-Small-3.2-24B-Instruct-2506`](https://huggingface.co/mistralai/Mistral-Small-3.2-24B-Instruct-2506)), or alternatively, use any model on [OpenRouter](https://openrouter.ai/) via an API call.
-
-See the [upsampling guide](docs/flux2_with_prompt_upsampling.md) for additional details and guidance on when to use upsampling.
-
-## `FLUX.2` autoencoder
-
-The FLUX.2 autoencoder has considerably improved over the [FLUX.1 autoencoder](https://huggingface.co/black-forest-labs/FLUX.1-dev/blob/main/ae.safetensors). The autoencoder is released under [Apache 2.0](https://huggingface.co/datasets/choosealicense/licenses/blob/main/markdown/apache-2.0.md) and can be found [here](https://huggingface.co/black-forest-labs/FLUX.2-dev/blob/main/ae.safetensors). For more information, see our [technical blogpost](https://bfl.ai/research/representation-comparison).
-
-## Local installation
-
-The inference code was tested on GB200 using CUDA 12.9 and Python 3.12.
+Create an environment and install the package:
 
 ```bash
-python3.12 -m venv .venv
+python -m venv .venv
 source .venv/bin/activate
-pip install -e . --extra-index-url https://download.pytorch.org/whl/cu129 --no-cache-dir
+pip install -e .
 ```
 
-## Run the CLI
+On Windows PowerShell:
 
-Before running the CLI, you may download the weights from [here](https://huggingface.co/black-forest-labs/FLUX.2-dev) and set the following environment variables.
+```powershell
+python -m venv .venv
+.\.venv\Scripts\Activate.ps1
+pip install -e .
+```
+
+Extra packages used by some metrics or submodules may be needed depending on the
+script you run:
 
 ```bash
-export FLUX2_MODEL_PATH="<flux2_path>"
-export AE_MODEL_PATH="<ae_path>"
-export KLEIN_4B_MODEL_PATH="<klein_4b_path>"
-export KLEIN_4B_BASE_MODEL_PATH="<klein_4b_base_path>"
-export KLEIN_9B_MODEL_PATH="<klein_9b_path>"
-export KLEIN_9B_BASE_MODEL_PATH="<klein_9b_base_path>"
+pip install pytorch-msssim pyiqa lpips tqdm pillow accelerate tensorboard
 ```
 
-If you don't set the environment variables, the weights will be downloaded automatically.
+For CUDA builds, install PyTorch from the wheel index that matches your machine.
+The project lock/config currently uses PyTorch `2.8.0` and torchvision `0.23.0`.
 
-You can start an interactive session to do both text to image generation as well as editing (one or multiple) images with the following command:
+## Required Checkpoints
+
+Most workflows assume local model weights. Update the paths in the shell scripts
+or pass the corresponding command-line arguments.
+
+Common paths used by the scripts:
+
+| Argument / variable | Meaning |
+| --- | --- |
+| `FLUX_CKPT`, `--flux_ckpt` | FLUX.2 Klein transformer weights, for example `flux-2-klein-4b.safetensors`. |
+| `AE_CKPT`, `--ae_ckpt` | FLUX.2 autoencoder weights, for example `ae.safetensors`. |
+| `QWEN_CKPT`, `--qwen_ckpt` | Local Qwen text model used by the pipeline. |
+| `CLIP_CKPT`, `--clip_ckpt` | CLIP checkpoint used by Stage 1 training losses. |
+| `--elic_ckpt` | ELIC checkpoint used by FluxCodec/Stage 2 components. |
+| `--stage1_ckpt` | A trained Stage 1 checkpoint used to initialize Stage 2. |
+| `--dinov2_weights` | DINOv2 weights for the Stage 2 discriminator. |
+
+## Stage 1 Training
+
+Stage 1 trains the compression pipeline with rate-distortion and perceptual
+objectives. The main launcher is `Flow/train_stage1.sh`.
+
+```bash
+cd Flow
+
+export CUDA_DEVICES=0
+export NUM_PROCESSES=1
+export TRAIN_ROOT=/path/to/train/images
+export VAL_ROOT=/path/to/val/images
+export OUTPUT_DIR=./outputs/stage1
+
+export FLUX_CKPT=/path/to/FLUX.2-klein-4B/flux-2-klein-4b.safetensors
+export AE_CKPT=/path/to/FLUX.2-klein-4B/ae.safetensors
+export QWEN_CKPT=/path/to/Qwen3-4B-FP8
+export CLIP_CKPT=/path/to/clip-vit-base-patch32
+
+bash train_stage1.sh
+```
+
+To resume from the latest run under the configured output directory:
+
+```bash
+RESUME=1 bash train_stage1.sh
+```
+
+The launcher writes run folders under `OUTPUT_DIR`, including checkpoints,
+logs, and the saved training configuration.
+
+## Stage 1 Inference
+
+Use `Flow/infer_stage1.sh` for dataset inference. It supports one or more input
+directories and writes reconstructions, per-image metrics, and summary JSON/CSV
+files.
+
+```bash
+cd Flow
+
+export CUDA_DEVICES=0
+export NUM_PROCESSES=1
+export INPUT_DIRS="/path/to/Kodak /path/to/CLIC"
+export CHECKPOINT=/path/to/stage1/checkpoint.pt
+
+export FLUX_CKPT=/path/to/FLUX.2-klein-4B/flux-2-klein-4b.safetensors
+export AE_CKPT=/path/to/FLUX.2-klein-4B/ae.safetensors
+export QWEN_CKPT=/path/to/Qwen3-4B-FP8
+
+bash infer_stage1.sh
+```
+
+Useful inference flags:
+
+```bash
+bash infer_stage1.sh --batch_size 1 --infer_steps 4 --skip_metrics
+bash infer_stage1.sh --no_entropy_coding
+```
+
+Typical output structure:
+
+```text
+outputs/infer_Kodak_bpp0.1234/
+  recon/
+  metrics_all_datasets.csv
+  metrics_summary.json
+  infer_config.json
+```
+
+Metrics include PSNR, MS-SSIM, LPIPS, DISTS, and BPP when the required metric
+packages and entropy coding path are enabled.
+
+## FluxCodec Workflow
+
+`FluxCodec/` contains the newer training and inference scripts. These scripts
+follow the same checkpoint/path assumptions, but keep the code and outputs under
+the `FluxCodec` module.
+
+Training:
+
+```bash
+cd FluxCodec
+bash train.sh
+```
+
+Inference:
+
+```bash
+cd FluxCodec
+bash inference.sh
+```
+
+Before launching, edit the dataset, checkpoint, and model paths in the shell
+scripts or pass equivalent CLI arguments directly to `train.py` / `inference.py`.
+
+## Stage 2 GAN Fine-Tuning
+
+Stage 2 starts from a Stage 1 checkpoint and adds GAN/perceptual fine-tuning,
+borrowing the discriminator pattern from StableCodec. The main launcher is
+`FluxCodec/train_stage2.sh`.
+
+```bash
+cd FluxCodec
+
+# Edit --stage1_ckpt, dataset paths, FLUX/AE/Qwen paths, ELIC path, and DINOv2 paths first.
+bash train_stage2.sh
+```
+
+For implementation notes and loss design, see:
+
+- `docs/stage2_gan_training.md`
+- `FluxCodec/train_stage2.py`
+- `FluxCodec/modules/losses_stage2.py`
+
+There is also a short-run tuning helper:
+
+```bash
+cd FluxCodec
+bash tune_stage2.sh
+```
+
+It launches multiple shorter trials and writes a ranked summary plus a suggested
+full-training script.
+
+## Upstream FLUX.2 CLI
+
+The original FLUX.2 CLI is still available for generation/editing experiments:
 
 ```bash
 PYTHONPATH=src python scripts/cli.py
 ```
 
-## Watermarking
+If the environment variables for FLUX.2 weights are not set, the upstream code
+may attempt to download weights automatically. For offline or cluster runs, set
+local model paths explicitly.
 
-We've added an option to embed invisible watermarks directly into the generated images
-via the [invisible watermark library](https://github.com/ShieldMnt/invisible-watermark).
+## Notes
 
-Additionally, we are recommending implementing a solution to mark the metadata of your outputs, such as [C2PA](https://c2pa.org/)
+- Many shell scripts currently contain machine-specific default paths. Treat them
+  as examples and override with environment variables or edit them for your
+  machine.
+- Large model weights and trained checkpoints are not expected to be committed.
+- Some older markdown files and comments may show mojibake/encoding artifacts;
+  the root README is the clean entry point for the current workflow.
+- This repository combines upstream and experimental research code. Check
+  individual model licenses before using weights or outputs commercially.
 
-## Citation
+## License
 
-If you find the provided code or models useful for your research, consider citing them as:
-
-```bib
-@misc{flux-2-2025,
-    author={Black Forest Labs},
-    title={{FLUX.2: Frontier Visual Intelligence}},
-    year={2025},
-    howpublished={\url{https://bfl.ai/blog/flux-2}},
-}
-```
+See `LICENSE.md` and the license files of the upstream components and model
+weights you use. FLUX.2, StableCodec, DiT-IC, DINOv2, and any downloaded
+checkpoints may have separate terms.
