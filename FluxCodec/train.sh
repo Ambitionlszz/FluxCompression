@@ -2,7 +2,7 @@
 # FluxCodec Stage1 Training Script
 
 # ===== GPU Configuration =====
-GPU_ID=0        # Single GPU: 0, 1, 2... Multi-GPU: 0,1
+GPU_ID=5        # Single GPU: 0, 1, 2... Multi-GPU: 0,1
 
 export CUDA_VISIBLE_DEVICES=$GPU_ID
 
@@ -22,25 +22,30 @@ accelerate launch \
     --batch_size 2 \
     --num_workers 4 \
     --max_steps 400000 \
-    --lr 1e-5 \
+    --lr 5e-5 \
     --grad_clip 1.0 \
     --train_schedule_steps 100 \
     --guidance 1.0 \
-    --lambda_rate 0.3 \
-    --d1_mse 1.0 \
+    --lambda_rate 0.5 \
+    --d1_mse 2.0 \
     --d2_lpips 1.0 \
     --d3_dists 0.2 \
-    --lora_rank 32 \
-    --lora_alpha 32.0 \
+    --lora_rank 64 \
+    --lora_alpha 64.0 \
+    --use_ae_lora 1 \
+    --ae_lora_rank 32 \
+    --ae_lora_alpha 32.0 \
+    --use_ema 1 \
+    --ema_decay 0.9999 \
     --codec_ch_emd 128 \
     --codec_channel 320 \
     --codec_channel_out 128 \
     --codec_num_slices 5 \
-    --use_aux_encoder 0 \
-    --use_aux_decoder 0 \
+    --use_aux_encoder 1 \
+    --use_aux_decoder 1 \
     --log_every 50 \
     --eval_every 5000 \
     --save_every 20000 \
     --eval_batches 24 \
     --use_tensorboard \
-    --save_log_file
+    --save_log_file \

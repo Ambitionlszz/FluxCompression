@@ -40,21 +40,32 @@ if str(SCRIPT_DIR) not in sys.path:
     sys.path.insert(0, str(SCRIPT_DIR))
 
 from modules.latent_codec import LatentCodec
-from modules.data import IMAGE_EXTENSIONS
-from modules.lora import inject_lora, load_lora_state_dict
+from modules.data import IMAGE_EXTENSIONS, ResizeIfSmall
+from modules.lora import inject_lora, inject_lora_conv, load_lora_state_dict
 from modules.pipeline import FluxCodecPipeline
 from modules.utils import ensure_dir, save_json, write_csv
 from elic_aux_encoder import load_elic_encoder
 
 
 class ImagePathDataset(Dataset):
-    def __init__(self, root: str):
+    def __init__(self, root: str, image_size: int | None = None, center_crop: bool = False):
         root = Path(root)
         if not root.is_dir():
             raise FileNotFoundError(f"Input dir not found: {root}")
         self.paths = [p for p in root.rglob("*") if p.suffix.lower() in IMAGE_EXTENSIONS]
         self.paths.sort()
-        self.to_tensor = transforms.ToTensor()
+        transform_list = []
+        if center_crop:
+            if image_size is None or image_size <= 0:
+                raise ValueError("--image_size must be positive when --center_crop is enabled")
+            transform_list.extend(
+                [
+                    ResizeIfSmall(image_size),
+                    transforms.CenterCrop(image_size),
+                ]
+            )
+        transform_list.append(transforms.ToTensor())
+        self.transform = transforms.Compose(transform_list)
 
     def __len__(self):
         return len(self.paths)
@@ -64,7 +75,7 @@ class ImagePathDataset(Dataset):
         try:
             image = Image.open(path).convert("RGB")
             return {
-                "image": self.to_tensor(image),
+                "image": self.transform(image),
                 "path": str(path),
             }
         except Exception as e:
@@ -95,6 +106,8 @@ def parse_args():
     parser.add_argument("--infer_steps", type=int, default=4)
     parser.add_argument("--do_entropy_coding", action="store_true", default=True)
     parser.add_argument("--no_entropy_coding", action="store_true")
+    parser.add_argument("--image_size", type=int, default=256, help="Crop size used with --center_crop")
+    parser.add_argument("--center_crop", action="store_true", help="Match training eval preprocessing instead of using original image sizes")
 
     parser.add_argument("--guidance", type=float, default=1.0)
     parser.add_argument("--mixed_precision", type=str, default="bf16", choices=["no", "fp16", "bf16"])
@@ -113,6 +126,16 @@ def parse_args():
     parser.add_argument("--use_aux_decoder", type=int, default=1, help="1 to enable AuxDecoder residual, 0 to disable")
 
     parser.add_argument("--color_fix", action="store_true", help="Apply StableCodec color fix strategy")
+    parser.add_argument("--unload_text_encoder", action="store_true", default=True,
+                        help="Cache fixed prompt embeddings and unload Qwen before inference")
+    parser.add_argument("--keep_text_encoder", action="store_true",
+                        help="Keep Qwen text encoder on GPU after prompt caching")
+    parser.add_argument("--use_tile", action="store_true",
+                        help="Enable latent-tiled FLUX denoise for large images")
+    parser.add_argument("--tile_latent_size", type=int, default=64,
+                        help="Latent tile size. 64 roughly equals 1024px image tiles.")
+    parser.add_argument("--tile_latent_overlap", type=int, default=16,
+                        help="Latent tile overlap used for blending")
 
     parser.add_argument("--skip_metrics", action="store_true")
     parser.add_argument("--save_images", action="store_true", default=True)
@@ -180,8 +203,16 @@ def main():
     if g_a_fuse_weight is not None:
         has_aux_encoder = g_a_fuse_weight.shape[1] > args.codec_ch_emd
         
+    # Auto-detect AE decoder LoRA
+    has_ae_lora = bool(ckpt.get("ae_decoder_lora"))
+    ae_lora_rank = 32
+    if has_ae_lora:
+        # Infer rank from first lora_A tensor shape
+        first_key = next(iter(ckpt["ae_decoder_lora"]))
+        ae_lora_rank = ckpt["ae_decoder_lora"][first_key].shape[0]
+
     if accelerator.is_main_process:
-        print(f"Auto-detected checkpoint config: use_aux_encoder={has_aux_encoder}, use_aux_decoder={has_aux_decoder}")
+        print(f"Auto-detected checkpoint config: use_aux_encoder={has_aux_encoder}, use_aux_decoder={has_aux_decoder}, use_ae_lora={has_ae_lora}")
     args.use_aux_encoder = int(has_aux_encoder)
     args.use_aux_decoder = int(has_aux_decoder)
 
@@ -216,8 +247,24 @@ def main():
         target_regex=args.lora_target_regex,
     )
 
+    if has_ae_lora:
+        inject_lora_conv(
+            pipeline.ae.decoder,
+            rank=ae_lora_rank,
+            alpha=ae_lora_rank,  # alpha not used at inference, matches training convention
+            dropout=args.lora_dropout,
+            target_regex=r".*",
+        )
+
     pipeline.codec.load_state_dict(ckpt["codec"])
     load_lora_state_dict(pipeline.flux, ckpt["flux_lora"])
+    if has_ae_lora:
+        load_lora_state_dict(pipeline.ae.decoder, ckpt["ae_decoder_lora"])
+    pipeline.cache_text_contexts(
+        max_batch_size=args.batch_size,
+        device=accelerator.device,
+        unload_text_encoder=args.unload_text_encoder and not args.keep_text_encoder,
+    )
     
     if accelerator.is_main_process:
         print(f"✓ Checkpoint weights loaded successfully")
@@ -235,10 +282,11 @@ def main():
     pipeline.codec.eval()
     pipeline.flux.eval()
 
-    lpips_metric = lpips.LPIPS(net="vgg").to(accelerator.device).eval()
-    if HAS_DISTS and not args.skip_metrics:
-        dists_metric = pyiqa.create_metric('dists').to(accelerator.device).eval()
+    if not args.skip_metrics:
+        lpips_metric = lpips.LPIPS(net="vgg").to(accelerator.device).eval()
+        dists_metric = pyiqa.create_metric('dists').to(accelerator.device).eval() if HAS_DISTS else None
     else:
+        lpips_metric = None
         dists_metric = None
 
     for input_dir in args.input_dirs:
@@ -248,7 +296,11 @@ def main():
             print(f"Processing dataset: {dataset_name} ({input_dir})")
             print(f"{'='*80}")
         
-        dataset = ImagePathDataset(input_dir)
+        dataset = ImagePathDataset(
+            input_dir,
+            image_size=args.image_size,
+            center_crop=args.center_crop,
+        )
         loader = DataLoader(
             dataset,
             batch_size=args.batch_size,
@@ -287,6 +339,8 @@ def main():
                         infer_steps=args.infer_steps,
                         do_entropy_coding=args.do_entropy_coding,
                         color_fix=args.color_fix,
+                        tile_latent_size=args.tile_latent_size if args.use_tile else 0,
+                        tile_latent_overlap=args.tile_latent_overlap,
                     )
             
             torch.cuda.synchronize()

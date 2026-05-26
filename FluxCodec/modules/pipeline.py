@@ -4,6 +4,7 @@ Replaced TCM with LatentCodec, adding ELIC auxiliary encoder.
 """
 import os
 import sys
+import gc
 from typing import Optional, Tuple
 
 import torch
@@ -186,6 +187,11 @@ class FluxCodecPipeline(nn.Module):
                 self._prompt_cache[batch_size] = (ctx, ctx_ids)
             return ctx, ctx_ids
 
+        if getattr(self, "text_encoder", None) is None:
+            raise RuntimeError(
+                f"Text context for batch_size={batch_size} was not cached before unloading the text encoder."
+            )
+
         prompts = [FIXED_PROMPT] * batch_size
         if self.guidance_distilled:
             ctx = self.text_encoder(prompts).to(torch.bfloat16)
@@ -198,11 +204,125 @@ class FluxCodecPipeline(nn.Module):
         self._prompt_cache[batch_size] = (ctx.to(device), ctx_ids.to(device))
         return ctx, ctx_ids
 
+    @torch.no_grad()
+    def cache_text_contexts(self, max_batch_size: int, device: torch.device, unload_text_encoder: bool = False):
+        """Precompute fixed-prompt embeddings for inference batch sizes."""
+        for batch_size in range(1, max_batch_size + 1):
+            self.get_text_context(batch_size=batch_size, device=device)
+        if unload_text_encoder:
+            self.unload_text_encoder()
+
+    def unload_text_encoder(self):
+        """Free the frozen text encoder after fixed prompt embeddings are cached."""
+        if getattr(self, "text_encoder", None) is None:
+            return
+        del self.text_encoder
+        self.text_encoder = None
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+
     def _latent_to_tokens(self, z: torch.Tensor):
         return batched_prc_img(z.to(torch.bfloat16))
 
+    def _latent_tile_to_tokens(self, z: torch.Tensor, h_offset: int, w_offset: int):
+        tokens, ids = batched_prc_img(z.to(torch.bfloat16))
+        ids = ids.clone()
+        ids[..., 1] += h_offset
+        ids[..., 2] += w_offset
+        return tokens, ids
+
     def _tokens_to_latent(self, x_tokens: torch.Tensor, x_ids: torch.Tensor) -> torch.Tensor:
         return torch.cat(scatter_ids(x_tokens, x_ids)).squeeze(2)
+
+    def _tokens_to_tile_latent(self, x_tokens: torch.Tensor, height: int, width: int) -> torch.Tensor:
+        b, seq, c = x_tokens.shape
+        if seq != height * width:
+            raise ValueError(f"Token count {seq} does not match tile shape {height}x{width}")
+        return x_tokens.transpose(1, 2).reshape(b, c, height, width)
+
+    def _tile_starts(self, size: int, tile_size: int, stride: int) -> list[int]:
+        if size <= tile_size:
+            return [0]
+        starts = list(range(0, size - tile_size + 1, stride))
+        if starts[-1] != size - tile_size:
+            starts.append(size - tile_size)
+        return starts
+
+    def _tile_blend_weight(self, height: int, width: int, overlap: int, device, dtype) -> torch.Tensor:
+        weight_y = torch.ones(height, device=device, dtype=dtype)
+        weight_x = torch.ones(width, device=device, dtype=dtype)
+        ramp_y = min(overlap, height // 2)
+        ramp_x = min(overlap, width // 2)
+        if ramp_y > 0:
+            ramp = torch.linspace(0.05, 1.0, ramp_y, device=device, dtype=dtype)
+            weight_y[:ramp_y] = ramp
+            weight_y[-ramp_y:] = ramp.flip(0)
+        if ramp_x > 0:
+            ramp = torch.linspace(0.05, 1.0, ramp_x, device=device, dtype=dtype)
+            weight_x[:ramp_x] = ramp
+            weight_x[-ramp_x:] = ramp.flip(0)
+        return weight_y[:, None] * weight_x[None, :]
+
+    @torch.no_grad()
+    def _denoise_latents(
+        self,
+        z_tcm: torch.Tensor,
+        infer_steps: int,
+        ctx: torch.Tensor,
+        ctx_ids: torch.Tensor,
+    ) -> torch.Tensor:
+        z_tcm_tokens, z_ids = self._latent_to_tokens(z_tcm)
+        timesteps = get_schedule(infer_steps, z_tcm_tokens.shape[1])
+        z_out_tokens = denoise(
+            self.flux,
+            img=z_tcm_tokens, img_ids=z_ids,
+            txt=ctx, txt_ids=ctx_ids,
+            timesteps=timesteps,
+            guidance=self.guidance,
+        )
+        return self._tokens_to_latent(z_out_tokens, z_ids)
+
+    @torch.no_grad()
+    def _denoise_latents_tiled(
+        self,
+        z_tcm: torch.Tensor,
+        infer_steps: int,
+        ctx: torch.Tensor,
+        ctx_ids: torch.Tensor,
+        tile_size: int,
+        overlap: int,
+    ) -> torch.Tensor:
+        b, c, h, w = z_tcm.shape
+        if tile_size <= 0 or (h <= tile_size and w <= tile_size):
+            return self._denoise_latents(z_tcm, infer_steps, ctx, ctx_ids)
+
+        tile_size = min(tile_size, h, w)
+        overlap = max(0, min(overlap, tile_size - 1))
+        stride = max(1, tile_size - overlap)
+
+        out_accum = torch.zeros((b, c, h, w), device=z_tcm.device, dtype=torch.float32)
+        weight_accum = torch.zeros((b, 1, h, w), device=z_tcm.device, dtype=torch.float32)
+
+        for y0 in self._tile_starts(h, tile_size, stride):
+            for x0 in self._tile_starts(w, tile_size, stride):
+                tile = z_tcm[:, :, y0:y0 + tile_size, x0:x0 + tile_size]
+                th, tw = tile.shape[-2:]
+                tile_tokens, tile_ids = self._latent_tile_to_tokens(tile, h_offset=y0, w_offset=x0)
+                timesteps = get_schedule(infer_steps, tile_tokens.shape[1])
+                tile_out_tokens = denoise(
+                    self.flux,
+                    img=tile_tokens, img_ids=tile_ids,
+                    txt=ctx, txt_ids=ctx_ids,
+                    timesteps=timesteps,
+                    guidance=self.guidance,
+                )
+                tile_out = self._tokens_to_tile_latent(tile_out_tokens, th, tw).to(torch.float32)
+                weight = self._tile_blend_weight(th, tw, overlap, z_tcm.device, torch.float32)
+                out_accum[:, :, y0:y0 + th, x0:x0 + tw] += tile_out * weight.view(1, 1, th, tw)
+                weight_accum[:, :, y0:y0 + th, x0:x0 + tw] += weight.view(1, 1, th, tw)
+
+        return (out_accum / weight_accum.clamp_min(1e-6)).to(z_tcm.dtype)
 
     # ==================== Training Interface ====================
  
@@ -273,6 +393,8 @@ class FluxCodecPipeline(nn.Module):
         infer_steps: int = 4,
         do_entropy_coding: bool = True,
         color_fix: bool = False,
+        tile_latent_size: int = 0,
+        tile_latent_overlap: int = 16,
     ) -> dict:
         """Inference: AE encode -> ELIC -> LatentCodec (entropy coding) -> FLUX multistep denoise -> AE decode"""
         batch_size = x01.shape[0]
@@ -306,18 +428,15 @@ class FluxCodecPipeline(nn.Module):
             total_bytes = [0.0] * batch_size
 
         # 4. FLUX Multistep Denoise
-        z_tcm_tokens, z_ids = self._latent_to_tokens(z_tcm)
         ctx, ctx_ids = self.get_text_context(batch_size=batch_size, device=device)
- 
-        timesteps = get_schedule(infer_steps, z_tcm_tokens.shape[1])
-        z_out_tokens = denoise(
-            self.flux,
-            img=z_tcm_tokens, img_ids=z_ids,
-            txt=ctx, txt_ids=ctx_ids,
-            timesteps=timesteps,
-            guidance=self.guidance,
+        z_out = self._denoise_latents_tiled(
+            z_tcm,
+            infer_steps=infer_steps,
+            ctx=ctx,
+            ctx_ids=ctx_ids,
+            tile_size=tile_latent_size,
+            overlap=tile_latent_overlap,
         )
-        z_out = self._tokens_to_latent(z_out_tokens, z_ids)
  
         # 5. Auxiliary Residual Addition
         if res_batch is not None:

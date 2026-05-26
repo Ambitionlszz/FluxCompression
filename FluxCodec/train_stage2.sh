@@ -29,7 +29,7 @@ accelerate launch \
     --grad_clip 1.0 \
     --train_schedule_steps 100 \
     --guidance 1.0 \
-    --lambda_rate 0.3 \
+    --lambda_rate 0.5 \
     --lambda_l2 1.0 \
     --lambda_lpips 1.0 \
     --lambda_dists 0.2 \
@@ -42,6 +42,11 @@ accelerate launch \
     --lr_decay_values "2e-5,1e-5,1e-6" \
     --lora_rank 32 \
     --lora_alpha 32.0 \
+    --use_ae_lora 1 \
+    --ae_lora_rank 32 \
+    --ae_lora_alpha 32.0 \
+    --use_ema 1 \
+    --ema_decay 0.9999 \
     --codec_ch_emd 128 \
     --codec_channel 320 \
     --codec_channel_out 128 \

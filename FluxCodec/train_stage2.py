@@ -34,11 +34,11 @@ from modules.data import (
     build_train_transform, build_val_transform, build_eval_transform,
 )
 from modules.discriminator import Discriminator
-from modules.lora import inject_lora, load_lora_state_dict, lora_state_dict
+from modules.lora import inject_lora, inject_lora_conv, load_lora_state_dict, lora_state_dict
 from modules.losses_stage2 import Stage2Loss
 from modules.pipeline import FluxCodecPipeline
 from modules.evaluators import Stage1Evaluator
-from modules.utils import AverageMeter, ensure_dir, save_checkpoint, save_json
+from modules.utils import AverageMeter, EMA, ensure_dir, save_checkpoint, save_json
 from elic_aux_encoder import load_elic_encoder
 
 
@@ -108,6 +108,16 @@ def parse_args():
     p.add_argument("--lora_dropout", type=float, default=0.0)
     p.add_argument("--lora_target_regex", type=str, default=r".*")
 
+    # AE Decoder LoRA
+    p.add_argument("--use_ae_lora", type=int, default=1, help="1 to inject LoRA into AE decoder, 0 to disable")
+    p.add_argument("--ae_lora_rank", type=int, default=32)
+    p.add_argument("--ae_lora_alpha", type=float, default=32.0)
+    p.add_argument("--ae_lora_target_regex", type=str, default=r".*")
+
+    # EMA
+    p.add_argument("--use_ema", type=int, default=1, help="1 to enable EMA, 0 to disable")
+    p.add_argument("--ema_decay", type=float, default=0.9999, help="EMA decay rate")
+
     # LatentCodec
     p.add_argument("--codec_ch_emd", type=int, default=128)
     p.add_argument("--codec_channel", type=int, default=320)
@@ -162,7 +172,13 @@ def load_stage1_checkpoint(args, pipeline, accelerator):
     if lora_dict:
         missing_lora = load_lora_state_dict(pipeline.flux, lora_dict)
         if accelerator.is_main_process:
-            print(f"  LoRA loaded: {len(lora_dict)} tensors, missing: {len(missing_lora)}")
+            print(f"  FLUX LoRA loaded: {len(lora_dict)} tensors, missing: {len(missing_lora)}")
+
+    if args.use_ae_lora and state.get("ae_decoder_lora"):
+        missing_ae = load_lora_state_dict(pipeline.ae.decoder, state["ae_decoder_lora"])
+        if accelerator.is_main_process:
+            print(f"  AE Decoder LoRA loaded: {len(state['ae_decoder_lora'])} tensors, missing: {len(missing_ae)}")
+
     return state
 
 
@@ -181,7 +197,23 @@ def main():
     run_dir = ckpt_dir = log_dir = writer = log_file_handle = None
     if accelerator.is_main_process:
         timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-        run_dir = os.path.join(args.output_dir, f"run_{timestamp}")
+        lr_str = str(args.lr).replace("e-0", "e-")
+        lrd_str = str(args.lr_disc).replace("e-0", "e-")
+        name_parts = [f"lr{lr_str}", f"ld{args.lambda_rate}", f"gan{args.lambda_gan}", f"lrd{lrd_str}"]
+        if args.use_ae_lora:
+            name_parts.append("ael")
+        else:
+            name_parts.append("noael")
+        if args.use_ema:
+            name_parts.append("ema")
+        else:
+            name_parts.append("noema")
+        if not args.use_aux_encoder:
+            name_parts.append("noauxe")
+        if not args.use_aux_decoder:
+            name_parts.append("noauxd")
+        run_name = f"run_{timestamp}_{'_'.join(name_parts)}"
+        run_dir = os.path.join(args.output_dir, run_name)
         ckpt_dir = os.path.join(run_dir, "checkpoints")
         log_dir = os.path.join(run_dir, "logs")
         for d in [ckpt_dir, log_dir, os.path.join(run_dir, "eval_images_multistep")]:
@@ -234,6 +266,17 @@ def main():
         dropout=args.lora_dropout, target_regex=args.lora_target_regex,
     )
 
+    # AE Decoder LoRA
+    ae_lora_stats = None
+    if args.use_ae_lora:
+        ae_lora_stats = inject_lora_conv(
+            pipeline.ae.decoder,
+            rank=args.ae_lora_rank,
+            alpha=args.ae_lora_alpha,
+            dropout=args.lora_dropout,
+            target_regex=args.ae_lora_target_regex,
+        )
+
     # Load Stage1 weights
     load_stage1_checkpoint(args, pipeline, accelerator)
 
@@ -265,14 +308,15 @@ def main():
     )
 
     # ========== Optimizers ==========
-    # Generator: codec + FLUX LoRA (same as StableCodec layers_to_opt)
+    # Generator: codec + FLUX LoRA + AE decoder LoRA
     codec_params = [p for n, p in pipeline.codec.named_parameters()
                     if not n.endswith("quantiles") and p.requires_grad]
     aux_params = [p for n, p in pipeline.codec.named_parameters()
                   if n.endswith("quantiles") and p.requires_grad]
     flux_params = [p for p in pipeline.flux.parameters() if p.requires_grad]
+    ae_decoder_params = [p for p in pipeline.ae.decoder.parameters() if p.requires_grad] if args.use_ae_lora else []
 
-    gen_params = codec_params + flux_params
+    gen_params = codec_params + flux_params + ae_decoder_params
     optimizer = torch.optim.AdamW(gen_params, lr=args.lr, weight_decay=0.0)
 
     # Discriminator optimizer + LR scheduler (StableCodec pattern)
@@ -302,6 +346,11 @@ def main():
         (pipeline.codec, pipeline.flux, criterion, net_disc,
          optimizer, optimizer_disc, train_loader, val_loader) = prepared
 
+    # EMA — created after prepare so shadows are on the correct device
+    ema_codec = EMA(accelerator.unwrap_model(pipeline.codec), decay=args.ema_decay) if args.use_ema else None
+    ema_flux = EMA(accelerator.unwrap_model(pipeline.flux), decay=args.ema_decay) if args.use_ema else None
+    ema_ae_decoder = EMA(pipeline.ae.decoder, decay=args.ema_decay) if (args.use_ema and args.use_ae_lora) else None
+
     pipeline.flux.train()
     pipeline.codec.train()
 
@@ -322,12 +371,19 @@ def main():
             state = torch.load(latest_ckpt, map_location="cpu")
             accelerator.unwrap_model(pipeline.codec).load_state_dict(state["codec"])
             load_lora_state_dict(accelerator.unwrap_model(pipeline.flux), state["flux_lora"])
+            if args.use_ae_lora and state.get("ae_decoder_lora"):
+                load_lora_state_dict(accelerator.unwrap_model(pipeline.ae.decoder), state["ae_decoder_lora"])
             optimizer.load_state_dict(state["optimizer"])
             optimizer_disc.load_state_dict(state["optimizer_disc"])
             if "discriminator" in state:
                 accelerator.unwrap_model(net_disc).load_state_dict(state["discriminator"])
             if "aux_optimizer" in state and aux_optimizer:
                 aux_optimizer.load_state_dict(state["aux_optimizer"])
+            if args.use_ema and "ema_codec" in state:
+                ema_codec.load_state_dict(state["ema_codec"])
+                ema_flux.load_state_dict(state["ema_flux"])
+                if ema_ae_decoder is not None and state.get("ema_ae_decoder"):
+                    ema_ae_decoder.load_state_dict(state["ema_ae_decoder"])
             global_step = int(state.get("global_step", 0))
             start_epoch = int(state.get("epoch", 0))
         elif accelerator.is_main_process:
@@ -339,7 +395,9 @@ def main():
         print(f"=== Stage2 GAN Training (StableCodec pattern) ===")
         print(f"Train: {len(train_dataset)} images | Val: {len(val_dataset)} images")
         print(f"Eval mode: {'center crop' if args.eval_center_crop else 'full image'} (batch_size={val_batch_size})")
-        print(f"LoRA: {lora_stats.injected_layers} layers, {lora_stats.trainable_params} params")
+        print(f"FLUX LoRA: {lora_stats.injected_layers} layers, {lora_stats.trainable_params} params")
+        if ae_lora_stats is not None:
+            print(f"AE Decoder LoRA: {ae_lora_stats.injected_layers} layers, {ae_lora_stats.trainable_params} params")
         print(f"Codec trainable: {total_codec} | Disc trainable: {disc_params}")
         print(f"Gen LR: {args.lr} | Disc LR: {args.lr_disc}")
         print(f"Loss: R*{args.lambda_rate} + L2*{args.lambda_l2} + LPIPS*{args.lambda_lpips} "
@@ -384,6 +442,14 @@ def main():
                 if accelerator.sync_gradients:
                     accelerator.clip_grad_norm_(gen_params, args.grad_clip)
                 optimizer.step()
+
+                # Update EMA
+                if args.use_ema:
+                    ema_codec.update(pipeline.codec)
+                    ema_flux.update(pipeline.flux)
+                    if ema_ae_decoder is not None:
+                        ema_ae_decoder.update(pipeline.ae.decoder)
+
                 optimizer.zero_grad(set_to_none=True)
 
                 # Auxiliary loss (entropy bottleneck CDF)
@@ -445,10 +511,23 @@ def main():
 
             # === Evaluation ===
             if global_step % args.eval_every == 0:
+                if args.use_ema:
+                    ema_codec.apply_shadow(pipeline.codec)
+                    ema_flux.apply_shadow(pipeline.flux)
+                    if ema_ae_decoder is not None:
+                        ema_ae_decoder.apply_shadow(pipeline.ae.decoder)
+
                 metrics = evaluator.evaluate(
                     pipeline=pipeline, criterion=criterion,
                     val_loader=val_loader, global_step=global_step,
                 )
+
+                if args.use_ema:
+                    ema_codec.restore(pipeline.codec)
+                    ema_flux.restore(pipeline.flux)
+                    if ema_ae_decoder is not None:
+                        ema_ae_decoder.restore(pipeline.ae.decoder)
+
                 if accelerator.is_main_process:
                     print(
                         f"[eval {global_step}] "
@@ -465,7 +544,11 @@ def main():
                     "global_step": global_step, "epoch": current_epoch,
                     "codec": accelerator.unwrap_model(pipeline.codec).state_dict(),
                     "flux_lora": lora_state_dict(accelerator.unwrap_model(pipeline.flux)),
+                    "ae_decoder_lora": lora_state_dict(accelerator.unwrap_model(pipeline.ae.decoder)) if args.use_ae_lora else None,
                     "discriminator": accelerator.unwrap_model(net_disc).state_dict(),
+                    "ema_codec": ema_codec.state_dict() if ema_codec is not None else None,
+                    "ema_flux": ema_flux.state_dict() if ema_flux is not None else None,
+                    "ema_ae_decoder": ema_ae_decoder.state_dict() if ema_ae_decoder is not None else None,
                     "optimizer": optimizer.state_dict(),
                     "optimizer_disc": optimizer_disc.state_dict(),
                     "aux_optimizer": aux_optimizer.state_dict() if aux_optimizer else None,
@@ -488,7 +571,11 @@ def main():
             "global_step": global_step, "epoch": current_epoch,
             "codec": accelerator.unwrap_model(pipeline.codec).state_dict(),
             "flux_lora": lora_state_dict(accelerator.unwrap_model(pipeline.flux)),
+            "ae_decoder_lora": lora_state_dict(accelerator.unwrap_model(pipeline.ae.decoder)) if args.use_ae_lora else None,
             "discriminator": accelerator.unwrap_model(net_disc).state_dict(),
+            "ema_codec": ema_codec.state_dict() if ema_codec is not None else None,
+            "ema_flux": ema_flux.state_dict() if ema_flux is not None else None,
+            "ema_ae_decoder": ema_ae_decoder.state_dict() if ema_ae_decoder is not None else None,
             "optimizer": optimizer.state_dict(),
             "optimizer_disc": optimizer_disc.state_dict(),
             "aux_optimizer": aux_optimizer.state_dict() if aux_optimizer else None,

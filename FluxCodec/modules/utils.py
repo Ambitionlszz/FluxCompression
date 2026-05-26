@@ -48,6 +48,45 @@ def save_checkpoint(path: str, state: dict[str, Any]):
     torch.save(state, path)
 
 
+class EMA:
+    """Exponential Moving Average for a single model's trainable parameters."""
+
+    def __init__(self, model: torch.nn.Module, decay: float = 0.9999):
+        self.decay = decay
+        self.shadow: dict[str, torch.Tensor] = {}
+        self._backup: dict[str, torch.Tensor] = {}
+        for name, param in model.named_parameters():
+            if param.requires_grad:
+                self.shadow[name] = param.data.clone().detach()
+
+    @torch.no_grad()
+    def update(self, model: torch.nn.Module):
+        for name, param in model.named_parameters():
+            if name in self.shadow:
+                self.shadow[name].mul_(self.decay).add_(param.data, alpha=1.0 - self.decay)
+
+    @torch.no_grad()
+    def apply_shadow(self, model: torch.nn.Module):
+        for name, param in model.named_parameters():
+            if name in self.shadow:
+                self._backup[name] = param.data.clone()
+                param.data.copy_(self.shadow[name])
+
+    @torch.no_grad()
+    def restore(self, model: torch.nn.Module):
+        for name, param in model.named_parameters():
+            if name in self._backup:
+                param.data.copy_(self._backup.pop(name))
+
+    def state_dict(self) -> dict[str, torch.Tensor]:
+        return self.shadow
+
+    def load_state_dict(self, state_dict: dict[str, torch.Tensor]):
+        for name, tensor in state_dict.items():
+            if name in self.shadow:
+                self.shadow[name].copy_(tensor)
+
+
 def write_csv(path: str, rows: list[dict[str, Any]]):
     if not rows:
         return

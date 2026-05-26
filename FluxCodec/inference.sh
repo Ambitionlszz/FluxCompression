@@ -4,14 +4,17 @@ set -euo pipefail
 NUM_PROCESSES=${NUM_PROCESSES:-1}
 MIXED_PRECISION=${MIXED_PRECISION:-bf16}
 MAIN_PORT=${MAIN_PORT:-29501}
-CUDA_DEVICES=${CUDA_DEVICES:-6}
+CUDA_DEVICES=${CUDA_DEVICES:-1}
 
 INPUT_DIRS=${INPUT_DIRS:-/data2/luosheng/data/Datasets/Kodak,/data2/luosheng/data/Datasets/DIV2K_valid_HR}
 INPUT_DIRS=${INPUT_DIRS//,/ }
-CHECKPOINT=${CHECKPOINT:-/data2/luosheng/code/flux2/FluxCodec/outputs/fluxcodec_stage1/run_20260521_032258/checkpoints/stage1_step_00040000.pt}
+CHECKPOINT=${CHECKPOINT:-/data2/luosheng/code/flux2/FluxCodec/outputs/fluxcodec_stage1/run_20260526_080302/checkpoints/stage1_step_00280000.pt}
 
 USE_GRADIENT_CHECKPOINTING=${USE_GRADIENT_CHECKPOINTING:-false}
 COLOR_FIX=${COLOR_FIX:-false}
+USE_TILE=${USE_TILE:-false}
+TILE_LATENT_SIZE=${TILE_LATENT_SIZE:-64}
+TILE_LATENT_OVERLAP=${TILE_LATENT_OVERLAP:-16}
 
 FIRST_INPUT_DIR=$(echo ${INPUT_DIRS} | awk '{print $1}')
 DATASET_NAME=$(basename "${FIRST_INPUT_DIR}")
@@ -19,9 +22,9 @@ NUM_DATASETS=$(echo ${INPUT_DIRS} | wc -w)
 
 TIMESTAMP=$(date +"%Y%m%d_%H%M%S")
 if [ "${NUM_DATASETS}" -eq 1 ]; then
-  TEMP_OUTPUT_DIR="outputs/infer_${DATASET_NAME}_${TIMESTAMP}"
+  TEMP_OUTPUT_DIR="outputs/inference_stage1/infer_${DATASET_NAME}_${TIMESTAMP}"
 else
-  TEMP_OUTPUT_DIR="outputs/infer_multi_datasets_${TIMESTAMP}"
+  TEMP_OUTPUT_DIR="outputs/inference_stage1/infer_multi_datasets_${TIMESTAMP}"
 fi
 OUTPUT_DIR=${OUTPUT_DIR:-${TEMP_OUTPUT_DIR}}
 
@@ -59,6 +62,18 @@ if [ "${COLOR_FIX}" = "true" ]; then
   echo "[inference] ✓ Color fix enabled"
 fi
 
+TILE_ARGS=()
+if [ "${USE_TILE}" = "true" ]; then
+  TILE_ARGS=(
+    "--use_tile"
+    "--tile_latent_size" "${TILE_LATENT_SIZE}"
+    "--tile_latent_overlap" "${TILE_LATENT_OVERLAP}"
+  )
+  echo "[inference] Tile inference enabled: latent_size=${TILE_LATENT_SIZE}, overlap=${TILE_LATENT_OVERLAP}"
+else
+  echo "[inference] Tile inference disabled"
+fi
+
 accelerate launch \
   --num_processes "${NUM_PROCESSES}" \
   --main_process_port "${MAIN_PORT}" \
@@ -75,6 +90,7 @@ accelerate launch \
   --do_entropy_coding \
   ${GC_ARG} \
   ${COLOR_FIX_ARG} \
+  "${TILE_ARGS[@]}" \
   "$@"
 
 if [ -f "${OUTPUT_DIR}/metrics_summary.json" ]; then
