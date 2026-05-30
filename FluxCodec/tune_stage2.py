@@ -112,12 +112,17 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--lr_decay_values", type=str, default="2e-5,1e-5,1e-6")
     p.add_argument("--lora_rank", type=int, default=32)
     p.add_argument("--lora_alpha", type=float, default=32.0)
+    p.add_argument("--use_ae_encoder_lora", type=int, default=1)
+    p.add_argument("--ae_encoder_lora_rank", type=int, default=32)
+    p.add_argument("--ae_encoder_lora_alpha", type=float, default=32.0)
     p.add_argument("--codec_ch_emd", type=int, default=128)
     p.add_argument("--codec_channel", type=int, default=320)
     p.add_argument("--codec_channel_out", type=int, default=128)
     p.add_argument("--codec_num_slices", type=int, default=5)
     p.add_argument("--use_aux_encoder", type=int, default=1)
     p.add_argument("--use_aux_decoder", type=int, default=1)
+    p.add_argument("--aux_decoder_zero_init", type=int, default=0)
+    p.add_argument("--elic_proj_channels", type=int, default=64, help="ELIC feature projection channels (320 -> elic_proj_channels)")
 
     return p.parse_args()
 
@@ -180,12 +185,17 @@ def build_train_options(
         "lr_decay_values": args.lr_decay_values,
         "lora_rank": args.lora_rank,
         "lora_alpha": args.lora_alpha,
+        "use_ae_encoder_lora": args.use_ae_encoder_lora,
+        "ae_encoder_lora_rank": args.ae_encoder_lora_rank,
+        "ae_encoder_lora_alpha": args.ae_encoder_lora_alpha,
         "codec_ch_emd": args.codec_ch_emd,
         "codec_channel": args.codec_channel,
         "codec_channel_out": args.codec_channel_out,
         "codec_num_slices": args.codec_num_slices,
         "use_aux_encoder": args.use_aux_encoder,
         "use_aux_decoder": args.use_aux_decoder,
+        "aux_decoder_zero_init": args.aux_decoder_zero_init,
+        "elic_proj_channels": args.elic_proj_channels,
         "log_every": min(20, eval_every if eval_every is not None else args.eval_every),
         "eval_every": eval_every if eval_every is not None else args.eval_every,
         "save_every": args.save_every,
@@ -306,6 +316,10 @@ def write_csv_summary(path: Path, rows: list[dict[str, Any]]) -> None:
         "guidance",
         "lr_decay_steps",
         "lr_decay_values",
+        "aux_decoder_zero_init",
+        "use_ae_encoder_lora",
+        "ae_encoder_lora_rank",
+        "ae_encoder_lora_alpha",
     ]
     with path.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=fieldnames)

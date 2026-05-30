@@ -12,6 +12,7 @@ CHECKPOINT=${CHECKPOINT:-/data2/luosheng/code/flux2/FluxCodec/outputs/fluxcodec_
 
 USE_GRADIENT_CHECKPOINTING=${USE_GRADIENT_CHECKPOINTING:-false}
 COLOR_FIX=${COLOR_FIX:-false}
+USE_EMA_WEIGHTS=${USE_EMA_WEIGHTS:-1}
 USE_TILE=${USE_TILE:-false}
 TILE_LATENT_SIZE=${TILE_LATENT_SIZE:-64}
 TILE_LATENT_OVERLAP=${TILE_LATENT_OVERLAP:-16}
@@ -88,6 +89,7 @@ accelerate launch \
   --elic_ckpt "${ELIC_CKPT}" \
   --infer_steps 4 \
   --do_entropy_coding \
+  --use_ema_weights "${USE_EMA_WEIGHTS}" \
   ${GC_ARG} \
   ${COLOR_FIX_ARG} \
   "${TILE_ARGS[@]}" \
@@ -118,6 +120,8 @@ if os.path.exists('${OUTPUT_DIR}/infer_config.json'):
             suffix = '_auxD'
         else:
             suffix = '_no_aux'
+        if data.get('use_ema_weights_applied', 0):
+            suffix += '_ema'
 print(suffix)
 ")
   

@@ -5,6 +5,7 @@
 GPU_ID=5        # Single GPU: 0, 1, 2... Multi-GPU: 0,1
 
 export CUDA_VISIBLE_DEVICES=$GPU_ID
+CLIP_CKPT=${CLIP_CKPT:-/data2/luosheng/hf_models/hub/clip-vit-base-patch32}
 
 accelerate launch \
     --mixed_precision bf16 \
@@ -29,12 +30,18 @@ accelerate launch \
     --lambda_rate 0.5 \
     --d1_mse 2.0 \
     --d2_lpips 1.0 \
-    --d3_dists 0.2 \
-    --lora_rank 64 \
-    --lora_alpha 64.0 \
-    --use_ae_lora 1 \
+    --d3_metric dists \
+    --d3_dists 0.1 \
+    --d3_clip 0.1 \
+    --clip_ckpt "$CLIP_CKPT" \
+    --lora_rank 32 \
+    --lora_alpha 32.0 \
+    --use_ae_lora 0 \
     --ae_lora_rank 32 \
     --ae_lora_alpha 32.0 \
+    --use_ae_encoder_lora 0 \
+    --ae_encoder_lora_rank 32 \
+    --ae_encoder_lora_alpha 32.0 \
     --use_ema 1 \
     --ema_decay 0.9999 \
     --codec_ch_emd 128 \
@@ -42,7 +49,9 @@ accelerate launch \
     --codec_channel_out 128 \
     --codec_num_slices 5 \
     --use_aux_encoder 1 \
-    --use_aux_decoder 1 \
+    --use_aux_decoder 0 \
+    --aux_decoder_zero_init 0 \
+    --elic_proj_channels 128 \
     --log_every 50 \
     --eval_every 5000 \
     --save_every 20000 \

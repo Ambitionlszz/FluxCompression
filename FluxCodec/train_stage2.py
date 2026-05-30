@@ -113,6 +113,10 @@ def parse_args():
     p.add_argument("--ae_lora_rank", type=int, default=32)
     p.add_argument("--ae_lora_alpha", type=float, default=32.0)
     p.add_argument("--ae_lora_target_regex", type=str, default=r".*")
+    p.add_argument("--use_ae_encoder_lora", type=int, default=0, help="1 to inject LoRA into AE encoder, 0 to disable")
+    p.add_argument("--ae_encoder_lora_rank", type=int, default=32)
+    p.add_argument("--ae_encoder_lora_alpha", type=float, default=32.0)
+    p.add_argument("--ae_encoder_lora_target_regex", type=str, default=r".*")
 
     # EMA
     p.add_argument("--use_ema", type=int, default=1, help="1 to enable EMA, 0 to disable")
@@ -125,6 +129,8 @@ def parse_args():
     p.add_argument("--codec_num_slices", type=int, default=5)
     p.add_argument("--use_aux_encoder", type=int, default=1)
     p.add_argument("--use_aux_decoder", type=int, default=1)
+    p.add_argument("--aux_decoder_zero_init", type=int, default=0)
+    p.add_argument("--elic_proj_channels", type=int, default=64, help="ELIC feature projection channels (320 -> elic_proj_channels)")
 
     # Logging / Eval / Save
     p.add_argument("--log_every", type=int, default=20)
@@ -144,6 +150,8 @@ def build_codec(args):
         channel_out=args.codec_channel_out, num_slices=args.codec_num_slices,
         use_aux_encoder=bool(args.use_aux_encoder),
         use_aux_decoder=bool(args.use_aux_decoder),
+        aux_decoder_zero_init=bool(args.aux_decoder_zero_init),
+        elic_proj_channels=args.elic_proj_channels,
     )
 
 
@@ -178,8 +186,50 @@ def load_stage1_checkpoint(args, pipeline, accelerator):
         missing_ae = load_lora_state_dict(pipeline.ae.decoder, state["ae_decoder_lora"])
         if accelerator.is_main_process:
             print(f"  AE Decoder LoRA loaded: {len(state['ae_decoder_lora'])} tensors, missing: {len(missing_ae)}")
+    if args.use_ae_encoder_lora and state.get("ae_encoder_lora"):
+        missing_ae_enc = load_lora_state_dict(pipeline.ae.encoder, state["ae_encoder_lora"])
+        if accelerator.is_main_process:
+            print(f"  AE Encoder LoRA loaded: {len(state['ae_encoder_lora'])} tensors, missing: {len(missing_ae_enc)}")
 
     return state
+
+
+def build_checkpoint_state(
+    global_step,
+    current_epoch,
+    pipeline,
+    net_disc,
+    optimizer,
+    optimizer_disc,
+    aux_optimizer,
+    args,
+    ema_codec,
+    ema_flux,
+    ema_ae_decoder,
+    ema_ae_encoder,
+    accelerator,
+    best_metric=None,
+    best_step=0,
+):
+    return {
+        "global_step": global_step,
+        "epoch": current_epoch,
+        "codec": accelerator.unwrap_model(pipeline.codec).state_dict(),
+        "flux_lora": lora_state_dict(accelerator.unwrap_model(pipeline.flux)),
+        "ae_decoder_lora": lora_state_dict(accelerator.unwrap_model(pipeline.ae.decoder)) if args.use_ae_lora else None,
+        "ae_encoder_lora": lora_state_dict(accelerator.unwrap_model(pipeline.ae.encoder)) if args.use_ae_encoder_lora else None,
+        "discriminator": accelerator.unwrap_model(net_disc).state_dict(),
+        "ema_codec": ema_codec.state_dict() if ema_codec is not None else None,
+        "ema_flux": ema_flux.state_dict() if ema_flux is not None else None,
+        "ema_ae_decoder": ema_ae_decoder.state_dict() if ema_ae_decoder is not None else None,
+        "ema_ae_encoder": ema_ae_encoder.state_dict() if ema_ae_encoder is not None else None,
+        "optimizer": optimizer.state_dict(),
+        "optimizer_disc": optimizer_disc.state_dict(),
+        "aux_optimizer": aux_optimizer.state_dict() if aux_optimizer else None,
+        "best_metric": best_metric,
+        "best_step": best_step,
+        "args": vars(args),
+    }
 
 
 def main():
@@ -204,6 +254,8 @@ def main():
             name_parts.append("ael")
         else:
             name_parts.append("noael")
+        if args.use_ae_encoder_lora:
+            name_parts.append("aee")
         if args.use_ema:
             name_parts.append("ema")
         else:
@@ -212,6 +264,8 @@ def main():
             name_parts.append("noauxe")
         if not args.use_aux_decoder:
             name_parts.append("noauxd")
+        elif args.aux_decoder_zero_init:
+            name_parts.append("auxdzero")
         run_name = f"run_{timestamp}_{'_'.join(name_parts)}"
         run_dir = os.path.join(args.output_dir, run_name)
         ckpt_dir = os.path.join(run_dir, "checkpoints")
@@ -276,6 +330,15 @@ def main():
             dropout=args.lora_dropout,
             target_regex=args.ae_lora_target_regex,
         )
+    ae_encoder_lora_stats = None
+    if args.use_ae_encoder_lora:
+        ae_encoder_lora_stats = inject_lora_conv(
+            pipeline.ae.encoder,
+            rank=args.ae_encoder_lora_rank,
+            alpha=args.ae_encoder_lora_alpha,
+            dropout=args.lora_dropout,
+            target_regex=args.ae_encoder_lora_target_regex,
+        )
 
     # Load Stage1 weights
     load_stage1_checkpoint(args, pipeline, accelerator)
@@ -308,15 +371,16 @@ def main():
     )
 
     # ========== Optimizers ==========
-    # Generator: codec + FLUX LoRA + AE decoder LoRA
+    # Generator: codec + FLUX LoRA + AE LoRA
     codec_params = [p for n, p in pipeline.codec.named_parameters()
                     if not n.endswith("quantiles") and p.requires_grad]
     aux_params = [p for n, p in pipeline.codec.named_parameters()
                   if n.endswith("quantiles") and p.requires_grad]
     flux_params = [p for p in pipeline.flux.parameters() if p.requires_grad]
     ae_decoder_params = [p for p in pipeline.ae.decoder.parameters() if p.requires_grad] if args.use_ae_lora else []
+    ae_encoder_params = [p for p in pipeline.ae.encoder.parameters() if p.requires_grad] if args.use_ae_encoder_lora else []
 
-    gen_params = codec_params + flux_params + ae_decoder_params
+    gen_params = codec_params + flux_params + ae_decoder_params + ae_encoder_params
     optimizer = torch.optim.AdamW(gen_params, lr=args.lr, weight_decay=0.0)
 
     # Discriminator optimizer + LR scheduler (StableCodec pattern)
@@ -350,6 +414,7 @@ def main():
     ema_codec = EMA(accelerator.unwrap_model(pipeline.codec), decay=args.ema_decay) if args.use_ema else None
     ema_flux = EMA(accelerator.unwrap_model(pipeline.flux), decay=args.ema_decay) if args.use_ema else None
     ema_ae_decoder = EMA(pipeline.ae.decoder, decay=args.ema_decay) if (args.use_ema and args.use_ae_lora) else None
+    ema_ae_encoder = EMA(pipeline.ae.encoder, decay=args.ema_decay) if (args.use_ema and args.use_ae_encoder_lora) else None
 
     pipeline.flux.train()
     pipeline.codec.train()
@@ -361,6 +426,8 @@ def main():
 
     global_step = 0
     start_epoch = 0
+    best_metric = None
+    best_step = 0
 
     # ========== Resume from Stage2 checkpoint ==========
     if args.resume:
@@ -373,6 +440,8 @@ def main():
             load_lora_state_dict(accelerator.unwrap_model(pipeline.flux), state["flux_lora"])
             if args.use_ae_lora and state.get("ae_decoder_lora"):
                 load_lora_state_dict(accelerator.unwrap_model(pipeline.ae.decoder), state["ae_decoder_lora"])
+            if args.use_ae_encoder_lora and state.get("ae_encoder_lora"):
+                load_lora_state_dict(accelerator.unwrap_model(pipeline.ae.encoder), state["ae_encoder_lora"])
             optimizer.load_state_dict(state["optimizer"])
             optimizer_disc.load_state_dict(state["optimizer_disc"])
             if "discriminator" in state:
@@ -384,8 +453,12 @@ def main():
                 ema_flux.load_state_dict(state["ema_flux"])
                 if ema_ae_decoder is not None and state.get("ema_ae_decoder"):
                     ema_ae_decoder.load_state_dict(state["ema_ae_decoder"])
+                if ema_ae_encoder is not None and state.get("ema_ae_encoder"):
+                    ema_ae_encoder.load_state_dict(state["ema_ae_encoder"])
             global_step = int(state.get("global_step", 0))
             start_epoch = int(state.get("epoch", 0))
+            best_metric = state.get("best_metric", None)
+            best_step = int(state.get("best_step", 0))
         elif accelerator.is_main_process:
             print(f"[resume] No Stage2 checkpoint found under {args.output_dir}")
 
@@ -398,6 +471,8 @@ def main():
         print(f"FLUX LoRA: {lora_stats.injected_layers} layers, {lora_stats.trainable_params} params")
         if ae_lora_stats is not None:
             print(f"AE Decoder LoRA: {ae_lora_stats.injected_layers} layers, {ae_lora_stats.trainable_params} params")
+        if ae_encoder_lora_stats is not None:
+            print(f"AE Encoder LoRA: {ae_encoder_lora_stats.injected_layers} layers, {ae_encoder_lora_stats.trainable_params} params")
         print(f"Codec trainable: {total_codec} | Disc trainable: {disc_params}")
         print(f"Gen LR: {args.lr} | Disc LR: {args.lr_disc}")
         print(f"Loss: R*{args.lambda_rate} + L2*{args.lambda_l2} + LPIPS*{args.lambda_lpips} "
@@ -449,6 +524,8 @@ def main():
                     ema_flux.update(pipeline.flux)
                     if ema_ae_decoder is not None:
                         ema_ae_decoder.update(pipeline.ae.decoder)
+                    if ema_ae_encoder is not None:
+                        ema_ae_encoder.update(pipeline.ae.encoder)
 
                 optimizer.zero_grad(set_to_none=True)
 
@@ -516,6 +593,8 @@ def main():
                     ema_flux.apply_shadow(pipeline.flux)
                     if ema_ae_decoder is not None:
                         ema_ae_decoder.apply_shadow(pipeline.ae.decoder)
+                    if ema_ae_encoder is not None:
+                        ema_ae_encoder.apply_shadow(pipeline.ae.encoder)
 
                 metrics = evaluator.evaluate(
                     pipeline=pipeline, criterion=criterion,
@@ -527,6 +606,8 @@ def main():
                     ema_flux.restore(pipeline.flux)
                     if ema_ae_decoder is not None:
                         ema_ae_decoder.restore(pipeline.ae.decoder)
+                    if ema_ae_encoder is not None:
+                        ema_ae_encoder.restore(pipeline.ae.encoder)
 
                 if accelerator.is_main_process:
                     print(
@@ -537,23 +618,50 @@ def main():
                     if writer:
                         for k, v in metrics.items():
                             writer.add_scalar(f"val/{k}", v, global_step)
+                    eval_metric = float(metrics["loss"])
+                    if best_metric is None or eval_metric < best_metric:
+                        best_metric = eval_metric
+                        best_step = global_step
+                        best_path = os.path.join(ckpt_dir, "stage2_best.pt")
+                        state = build_checkpoint_state(
+                            global_step,
+                            current_epoch,
+                            pipeline,
+                            net_disc,
+                            optimizer,
+                            optimizer_disc,
+                            aux_optimizer,
+                            args,
+                            ema_codec,
+                            ema_flux,
+                            ema_ae_decoder,
+                            ema_ae_encoder,
+                            accelerator,
+                            best_metric=best_metric,
+                            best_step=best_step,
+                        )
+                        save_checkpoint(best_path, state)
+                        print(f"Saved best checkpoint to {best_path} (eval_loss={best_metric:.6f}, step={best_step})")
 
             # === Save ===
             if global_step % args.save_every == 0 and accelerator.is_main_process:
-                state = {
-                    "global_step": global_step, "epoch": current_epoch,
-                    "codec": accelerator.unwrap_model(pipeline.codec).state_dict(),
-                    "flux_lora": lora_state_dict(accelerator.unwrap_model(pipeline.flux)),
-                    "ae_decoder_lora": lora_state_dict(accelerator.unwrap_model(pipeline.ae.decoder)) if args.use_ae_lora else None,
-                    "discriminator": accelerator.unwrap_model(net_disc).state_dict(),
-                    "ema_codec": ema_codec.state_dict() if ema_codec is not None else None,
-                    "ema_flux": ema_flux.state_dict() if ema_flux is not None else None,
-                    "ema_ae_decoder": ema_ae_decoder.state_dict() if ema_ae_decoder is not None else None,
-                    "optimizer": optimizer.state_dict(),
-                    "optimizer_disc": optimizer_disc.state_dict(),
-                    "aux_optimizer": aux_optimizer.state_dict() if aux_optimizer else None,
-                    "args": vars(args),
-                }
+                state = build_checkpoint_state(
+                    global_step,
+                    current_epoch,
+                    pipeline,
+                    net_disc,
+                    optimizer,
+                    optimizer_disc,
+                    aux_optimizer,
+                    args,
+                    ema_codec,
+                    ema_flux,
+                    ema_ae_decoder,
+                    ema_ae_encoder,
+                    accelerator,
+                    best_metric=best_metric,
+                    best_step=best_step,
+                )
                 path = os.path.join(ckpt_dir, f"stage2_step_{global_step:08d}.pt")
                 save_checkpoint(path, state)
                 print(f"Saved checkpoint: {path}")
@@ -567,20 +675,30 @@ def main():
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         final = os.path.join(ckpt_dir, "stage2_last.pt") if ckpt_dir else os.path.join(args.output_dir, "stage2_last.pt")
-        save_checkpoint(final, {
-            "global_step": global_step, "epoch": current_epoch,
-            "codec": accelerator.unwrap_model(pipeline.codec).state_dict(),
-            "flux_lora": lora_state_dict(accelerator.unwrap_model(pipeline.flux)),
-            "ae_decoder_lora": lora_state_dict(accelerator.unwrap_model(pipeline.ae.decoder)) if args.use_ae_lora else None,
-            "discriminator": accelerator.unwrap_model(net_disc).state_dict(),
-            "ema_codec": ema_codec.state_dict() if ema_codec is not None else None,
-            "ema_flux": ema_flux.state_dict() if ema_flux is not None else None,
-            "ema_ae_decoder": ema_ae_decoder.state_dict() if ema_ae_decoder is not None else None,
-            "optimizer": optimizer.state_dict(),
-            "optimizer_disc": optimizer_disc.state_dict(),
-            "aux_optimizer": aux_optimizer.state_dict() if aux_optimizer else None,
-            "args": vars(args),
-        })
+        state = build_checkpoint_state(
+            global_step,
+            current_epoch,
+            pipeline,
+            net_disc,
+            optimizer,
+            optimizer_disc,
+            aux_optimizer,
+            args,
+            ema_codec,
+            ema_flux,
+            ema_ae_decoder,
+            ema_ae_encoder,
+            accelerator,
+            best_metric=best_metric,
+            best_step=best_step,
+        )
+        save_checkpoint(final, state)
+        if best_metric is not None:
+            print(f"Best checkpoint: {os.path.join(ckpt_dir, 'stage2_best.pt')} (eval_loss={best_metric:.6f}, step={best_step})")
+        else:
+            best = os.path.join(ckpt_dir, "stage2_best.pt") if ckpt_dir else os.path.join(args.output_dir, "stage2_best.pt")
+            save_checkpoint(best, state)
+            print(f"No eval was run; saved final weights as best checkpoint: {best}")
         print("Stage2 training completed.")
         if writer: writer.close()
         if log_file_handle:

@@ -124,8 +124,11 @@ def parse_args():
     parser.add_argument("--codec_num_slices", type=int, default=5)
     parser.add_argument("--use_aux_encoder", type=int, default=1, help="1 to enable ELIC aux encoder, 0 to disable")
     parser.add_argument("--use_aux_decoder", type=int, default=1, help="1 to enable AuxDecoder residual, 0 to disable")
+    parser.add_argument("--aux_decoder_zero_init", type=int, default=0, help="Only affects randomly initialized AuxDecoder before checkpoint loading")
+    parser.add_argument("--elic_proj_channels", type=int, default=64, help="ELIC feature projection channels (320 -> elic_proj_channels)")
 
     parser.add_argument("--color_fix", action="store_true", help="Apply StableCodec color fix strategy")
+    parser.add_argument("--use_ema_weights", type=int, default=1, help="1 to load EMA weights from checkpoint when available")
     parser.add_argument("--unload_text_encoder", action="store_true", default=True,
                         help="Cache fixed prompt embeddings and unload Qwen before inference")
     parser.add_argument("--keep_text_encoder", action="store_true",
@@ -154,7 +157,151 @@ def build_codec(args):
         num_slices=args.codec_num_slices,
         use_aux_encoder=bool(args.use_aux_encoder),
         use_aux_decoder=bool(args.use_aux_decoder),
+        aux_decoder_zero_init=bool(args.aux_decoder_zero_init),
+        elic_proj_channels=args.elic_proj_channels,
     )
+
+
+def infer_lora_rank(lora_sd: dict[str, torch.Tensor], name: str) -> int:
+    for key, tensor in lora_sd.items():
+        if key.endswith(".lora_A"):
+            return int(tensor.shape[0])
+    for key, tensor in lora_sd.items():
+        if key.endswith(".lora_B"):
+            return int(tensor.shape[1])
+    raise KeyError(f"Could not infer {name} LoRA rank from keys: {list(lora_sd.keys())[:5]}")
+
+
+def _ckpt_arg(ckpt_args: dict, key: str, default):
+    return ckpt_args[key] if key in ckpt_args else default
+
+
+def _infer_codec_channel(codec_sd: dict[str, torch.Tensor], default: int) -> int:
+    weight = codec_sd.get("g_a.analysis_transform.2.down.weight")
+    if weight is not None:
+        return int(weight.shape[0])
+    return int(default)
+
+
+def _infer_elic_proj_channels(codec_sd: dict[str, torch.Tensor], default: int = 64) -> int:
+    weight = codec_sd.get("g_a.aux_proj.weight")
+    if weight is not None:
+        return int(weight.shape[0])
+    return int(default)
+
+
+def _infer_codec_ch_emd(codec_sd: dict[str, torch.Tensor], use_aux_encoder: bool, default: int) -> int:
+    weight = codec_sd.get("g_a.fuse.weight")
+    if weight is not None:
+        if use_aux_encoder:
+            aux_proj_weight = codec_sd.get("g_a.aux_proj.weight")
+            if aux_proj_weight is not None:
+                aux_channels = int(aux_proj_weight.shape[0])
+            else:
+                aux_channels = 64  # fallback for legacy checkpoints
+        else:
+            aux_channels = 0
+        return int(weight.shape[1] - aux_channels)
+    return int(default)
+
+
+def _infer_codec_channel_out(codec_sd: dict[str, torch.Tensor], default: int) -> int:
+    weight = codec_sd.get("g_s.synthesis_transform.4.weight")
+    if weight is not None:
+        return int(weight.shape[0])
+    return int(default)
+
+
+def apply_checkpoint_config(args, ckpt: dict):
+    codec_sd = ckpt["codec"]
+    ckpt_args = ckpt.get("args", {})
+
+    has_aux_encoder = bool(codec_sd.get("g_a.aux_proj.weight") is not None)
+    has_aux_decoder = any(k.startswith("aux.") for k in codec_sd.keys())
+
+    args.model_name = _ckpt_arg(ckpt_args, "model_name", args.model_name)
+    args.guidance = float(_ckpt_arg(ckpt_args, "guidance", args.guidance))
+
+    args.codec_channel = int(_ckpt_arg(ckpt_args, "codec_channel", _infer_codec_channel(codec_sd, args.codec_channel)))
+    args.codec_ch_emd = int(
+        _ckpt_arg(ckpt_args, "codec_ch_emd", _infer_codec_ch_emd(codec_sd, has_aux_encoder, args.codec_ch_emd))
+    )
+    args.codec_channel_out = int(
+        _ckpt_arg(ckpt_args, "codec_channel_out", _infer_codec_channel_out(codec_sd, args.codec_channel_out))
+    )
+    args.codec_num_slices = int(_ckpt_arg(ckpt_args, "codec_num_slices", args.codec_num_slices))
+    args.use_aux_encoder = int(has_aux_encoder)
+    args.use_aux_decoder = int(has_aux_decoder)
+    args.aux_decoder_zero_init = int(_ckpt_arg(ckpt_args, "aux_decoder_zero_init", args.aux_decoder_zero_init))
+    args.elic_proj_channels = int(
+        _ckpt_arg(ckpt_args, "elic_proj_channels", _infer_elic_proj_channels(codec_sd, args.elic_proj_channels))
+    )
+
+    args.lora_rank = int(_ckpt_arg(ckpt_args, "lora_rank", infer_lora_rank(ckpt["flux_lora"], "FLUX")))
+    args.lora_alpha = float(_ckpt_arg(ckpt_args, "lora_alpha", args.lora_rank))
+    args.lora_dropout = float(_ckpt_arg(ckpt_args, "lora_dropout", args.lora_dropout))
+    args.lora_target_regex = _ckpt_arg(ckpt_args, "lora_target_regex", args.lora_target_regex)
+
+    has_ae_decoder_lora = bool(ckpt.get("ae_decoder_lora"))
+    ae_decoder_lora_rank = 32
+    ae_decoder_lora_alpha = 32.0
+    ae_decoder_lora_target_regex = r".*"
+    if has_ae_decoder_lora:
+        ae_decoder_lora_rank = int(
+            _ckpt_arg(ckpt_args, "ae_lora_rank", infer_lora_rank(ckpt["ae_decoder_lora"], "AE decoder"))
+        )
+        ae_decoder_lora_alpha = float(_ckpt_arg(ckpt_args, "ae_lora_alpha", ae_decoder_lora_rank))
+        ae_decoder_lora_target_regex = _ckpt_arg(ckpt_args, "ae_lora_target_regex", ae_decoder_lora_target_regex)
+
+    has_ae_encoder_lora = bool(ckpt.get("ae_encoder_lora"))
+    ae_encoder_lora_rank = 32
+    ae_encoder_lora_alpha = 32.0
+    ae_encoder_lora_target_regex = r".*"
+    if has_ae_encoder_lora:
+        ae_encoder_lora_rank = int(
+            _ckpt_arg(
+                ckpt_args,
+                "ae_encoder_lora_rank",
+                infer_lora_rank(ckpt["ae_encoder_lora"], "AE encoder"),
+            )
+        )
+        ae_encoder_lora_alpha = float(_ckpt_arg(ckpt_args, "ae_encoder_lora_alpha", ae_encoder_lora_rank))
+        ae_encoder_lora_target_regex = _ckpt_arg(
+            ckpt_args, "ae_encoder_lora_target_regex", ae_encoder_lora_target_regex
+        )
+
+    args.use_ae_lora = int(has_ae_decoder_lora)
+    args.use_ae_encoder_lora = int(has_ae_encoder_lora)
+    args.ae_lora_rank = ae_decoder_lora_rank
+    args.ae_lora_alpha = ae_decoder_lora_alpha
+    args.ae_encoder_lora_rank = ae_encoder_lora_rank
+    args.ae_encoder_lora_alpha = ae_encoder_lora_alpha
+
+    return (
+        has_ae_decoder_lora,
+        ae_decoder_lora_rank,
+        ae_decoder_lora_alpha,
+        ae_decoder_lora_target_regex,
+        has_ae_encoder_lora,
+        ae_encoder_lora_rank,
+        ae_encoder_lora_alpha,
+        ae_encoder_lora_target_regex,
+    )
+
+
+def load_ema_parameters(model: torch.nn.Module, ema_state: dict[str, torch.Tensor], name: str) -> tuple[int, int]:
+    params = dict(model.named_parameters())
+    loaded = 0
+    missing = 0
+    for key, tensor in ema_state.items():
+        param = params.get(key)
+        if param is None:
+            missing += 1
+            continue
+        param.data.copy_(tensor.to(device=param.device, dtype=param.dtype))
+        loaded += 1
+    print(f"[EMA] Loaded {name}: {loaded} tensors, missing: {missing}")
+    return loaded, missing
 
 
 def collate_fn(batch):
@@ -195,26 +342,34 @@ def main():
     ckpt = torch.load(args.checkpoint, map_location="cpu")
     if "codec" not in ckpt or "flux_lora" not in ckpt:
         raise KeyError(f"Checkpoint format not recognized. Available keys: {list(ckpt.keys())}")
-        
-    codec_sd = ckpt["codec"]
-    has_aux_decoder = any(k.startswith("aux.") for k in codec_sd.keys())
-    g_a_fuse_weight = codec_sd.get("g_a.fuse.weight")
-    has_aux_encoder = False
-    if g_a_fuse_weight is not None:
-        has_aux_encoder = g_a_fuse_weight.shape[1] > args.codec_ch_emd
-        
-    # Auto-detect AE decoder LoRA
-    has_ae_lora = bool(ckpt.get("ae_decoder_lora"))
-    ae_lora_rank = 32
-    if has_ae_lora:
-        # Infer rank from first lora_A tensor shape
-        first_key = next(iter(ckpt["ae_decoder_lora"]))
-        ae_lora_rank = ckpt["ae_decoder_lora"][first_key].shape[0]
+
+    (
+        has_ae_decoder_lora,
+        ae_decoder_lora_rank,
+        ae_decoder_lora_alpha,
+        ae_decoder_lora_target_regex,
+        has_ae_encoder_lora,
+        ae_encoder_lora_rank,
+        ae_encoder_lora_alpha,
+        ae_encoder_lora_target_regex,
+    ) = apply_checkpoint_config(args, ckpt)
+    use_ema_weights = bool(args.use_ema_weights)
+    has_any_ema = any(ckpt.get(k) is not None for k in ("ema_codec", "ema_flux", "ema_ae_decoder", "ema_ae_encoder"))
+    args.use_ema_weights_applied = int(use_ema_weights and has_any_ema)
 
     if accelerator.is_main_process:
-        print(f"Auto-detected checkpoint config: use_aux_encoder={has_aux_encoder}, use_aux_decoder={has_aux_decoder}, use_ae_lora={has_ae_lora}")
-    args.use_aux_encoder = int(has_aux_encoder)
-    args.use_aux_decoder = int(has_aux_decoder)
+        print(
+            "Auto-detected checkpoint config: "
+            f"model_name={args.model_name}, guidance={args.guidance}, "
+            f"codec_ch_emd={args.codec_ch_emd}, codec_channel={args.codec_channel}, "
+            f"codec_channel_out={args.codec_channel_out}, codec_num_slices={args.codec_num_slices}, "
+            f"use_aux_encoder={bool(args.use_aux_encoder)}, use_aux_decoder={bool(args.use_aux_decoder)}, "
+            f"use_ae_lora={has_ae_decoder_lora}, use_ae_encoder_lora={has_ae_encoder_lora}, "
+            f"lora_rank={args.lora_rank}, lora_alpha={args.lora_alpha}, "
+            f"ae_lora_rank={ae_decoder_lora_rank if has_ae_decoder_lora else 'none'}, "
+            f"ae_encoder_lora_rank={ae_encoder_lora_rank if has_ae_encoder_lora else 'none'}, "
+            f"use_ema_weights={args.use_ema_weights_applied}"
+        )
 
     if accelerator.is_main_process:
         ensure_dir(args.output_dir)
@@ -247,19 +402,50 @@ def main():
         target_regex=args.lora_target_regex,
     )
 
-    if has_ae_lora:
+    if has_ae_decoder_lora:
         inject_lora_conv(
             pipeline.ae.decoder,
-            rank=ae_lora_rank,
-            alpha=ae_lora_rank,  # alpha not used at inference, matches training convention
+            rank=ae_decoder_lora_rank,
+            alpha=ae_decoder_lora_alpha,
             dropout=args.lora_dropout,
-            target_regex=r".*",
+            target_regex=ae_decoder_lora_target_regex,
+        )
+
+    if has_ae_encoder_lora:
+        inject_lora_conv(
+            pipeline.ae.encoder,
+            rank=ae_encoder_lora_rank,
+            alpha=ae_encoder_lora_alpha,
+            dropout=args.lora_dropout,
+            target_regex=ae_encoder_lora_target_regex,
         )
 
     pipeline.codec.load_state_dict(ckpt["codec"])
     load_lora_state_dict(pipeline.flux, ckpt["flux_lora"])
-    if has_ae_lora:
+    if has_ae_decoder_lora:
         load_lora_state_dict(pipeline.ae.decoder, ckpt["ae_decoder_lora"])
+    if has_ae_encoder_lora:
+        load_lora_state_dict(pipeline.ae.encoder, ckpt["ae_encoder_lora"])
+
+    if use_ema_weights:
+        if ckpt.get("ema_codec") is not None:
+            load_ema_parameters(pipeline.codec, ckpt["ema_codec"], "codec")
+        else:
+            print("[EMA] WARNING: ema_codec not found; using raw codec weights")
+        if ckpt.get("ema_flux") is not None:
+            load_ema_parameters(pipeline.flux, ckpt["ema_flux"], "FLUX LoRA")
+        else:
+            print("[EMA] WARNING: ema_flux not found; using raw FLUX LoRA weights")
+        if has_ae_decoder_lora:
+            if ckpt.get("ema_ae_decoder") is not None:
+                load_ema_parameters(pipeline.ae.decoder, ckpt["ema_ae_decoder"], "AE decoder LoRA")
+            else:
+                print("[EMA] WARNING: ema_ae_decoder not found; using raw AE decoder LoRA weights")
+        if has_ae_encoder_lora:
+            if ckpt.get("ema_ae_encoder") is not None:
+                load_ema_parameters(pipeline.ae.encoder, ckpt["ema_ae_encoder"], "AE encoder LoRA")
+            else:
+                print("[EMA] WARNING: ema_ae_encoder not found; using raw AE encoder LoRA weights")
     pipeline.cache_text_contexts(
         max_batch_size=args.batch_size,
         device=accelerator.device,
@@ -271,7 +457,6 @@ def main():
         print("Cleaning up memory after model loading...")
         
     del ckpt
-    del codec_sd
     torch.cuda.empty_cache()
     gc.collect()
     

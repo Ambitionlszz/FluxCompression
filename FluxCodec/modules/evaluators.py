@@ -38,7 +38,7 @@ class Stage1Evaluator:
             from .losses import DISTSMetric
             
             self._lpips_metric = lpips.LPIPS(net="vgg").to(device).eval()
-            self._dists_metric = DISTSMetric().to(device).eval()
+            self._dists_metric = DISTSMetric(as_loss=False).to(device).eval()
     
     @torch.no_grad()
     def evaluate(

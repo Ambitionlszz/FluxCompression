@@ -73,7 +73,7 @@ Output includes reconstructions, per-image metrics (PSNR, MS-SSIM, LPIPS, DISTS,
 
 - Images: always `[0, 1]` range in pipeline inputs/outputs. The AE encode step converts to `[-1, 1]`.
 - Latent padding: FLUX AE requires dimensions divisible by 16. LatentCodec additionally pads latents for hyperprior shape closure. All pipelines handle this via `encode_images`/`decode_latents` with `pad_info` dicts.
-- The `LatentCodec`'s aux decoder final conv is zero-initialized so the residual path is identity at the start of training.
+- The `LatentCodec`'s aux decoder final conv uses the default Conv2d initialization by default, matching DiT-IC/StableCodec behavior. Set `--aux_decoder_zero_init 1` to ablate the old zero-init residual path.
 - Shell scripts contain machine-specific paths — treat as examples, override with environment variables.
 - **FLUX LoRA**: `LoRALinear`, injected via `inject_lora()`. Rank typically 32-64, applied to all FLUX linear layers via regex `.*`. Injected after model creation; moved to model device explicitly.
 - **AE Decoder LoRA**: `LoRAConv2d`, injected via `inject_lora_conv()`. Uses `nn.Conv2d` (not raw `nn.Parameter`) for `lora_A`/`lora_B` so autocast handles dtype. Must call `.to(device=...)` after creation. Rank typically 32.

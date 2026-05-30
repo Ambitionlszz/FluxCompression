@@ -45,6 +45,9 @@ accelerate launch \
     --use_ae_lora 1 \
     --ae_lora_rank 32 \
     --ae_lora_alpha 32.0 \
+    --use_ae_encoder_lora 1 \
+    --ae_encoder_lora_rank 32 \
+    --ae_encoder_lora_alpha 32.0 \
     --use_ema 1 \
     --ema_decay 0.9999 \
     --codec_ch_emd 128 \
@@ -53,6 +56,8 @@ accelerate launch \
     --codec_num_slices 5 \
     --use_aux_encoder 1 \
     --use_aux_decoder 1 \
+    --aux_decoder_zero_init 0 \
+    --elic_proj_channels 64 \
     --log_every 20 \
     --eval_every 5000 \
     --save_every 10000 \

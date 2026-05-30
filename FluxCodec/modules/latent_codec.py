@@ -87,24 +87,25 @@ class AnalysisTransform(nn.Module):
     """
     g_a: 4x downsampling analysis transform.
     """
-    def __init__(self, ch_emd=128, channel=320, use_aux_encoder=True):
+    def __init__(self, ch_emd=128, channel=320, use_aux_encoder=True, elic_proj_channels=64):
         super().__init__()
         self.use_aux_encoder = use_aux_encoder
-        
-        # Channel reduction: project 320d ELIC features to 64d to prevent BPP explosion
+        self.elic_proj_channels = elic_proj_channels
+
+        # Channel reduction: project 320d ELIC features to elic_proj_channels to prevent BPP explosion
         if self.use_aux_encoder:
-            self.aux_proj = nn.Conv2d(320, 64, kernel_size=3, padding=1)
-            in_channels = ch_emd + 64
+            self.aux_proj = nn.Conv2d(320, elic_proj_channels, kernel_size=3, padding=1)
+            in_channels = ch_emd + elic_proj_channels
         else:
             self.aux_proj = None
             in_channels = ch_emd
-            
-        self.fuse = nn.Conv2d(in_channels, 192, kernel_size=3, padding=1)  # channel fusion
+
+        self.fuse = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)  # channel fusion
 
         self.analysis_transform = nn.Sequential(
-            DepthConvBlock(192, 192),
-            DepthConvBlock(192, 192),
-            Downsample(192, channel),      # 1x down -> (16x16 -> 8x8)
+            DepthConvBlock(in_channels, in_channels),
+            DepthConvBlock(in_channels, in_channels),
+            Downsample(in_channels, channel),      # 1x down -> (16x16 -> 8x8)
             DepthConvBlock(channel, channel),
             DepthConvBlock(channel, channel),
         )
@@ -226,8 +227,9 @@ class LRP(nn.Module):
 
 class LatentCodec(nn.Module):
     def __init__(self, ch_emd=128, channel=320, channel_out=128,
-                 num_slices=5, max_support_slices=5, 
-                 use_aux_encoder=True, use_aux_decoder=True, **kwargs):
+                 num_slices=5, max_support_slices=5,
+                 use_aux_encoder=True, use_aux_decoder=True,
+                 aux_decoder_zero_init=False, elic_proj_channels=64, **kwargs):
         super().__init__()
 
         M = channel
@@ -236,8 +238,10 @@ class LatentCodec(nn.Module):
         self.max_support_slices = max_support_slices
         self.use_aux_encoder = use_aux_encoder
         self.use_aux_decoder = use_aux_decoder
+        self.aux_decoder_zero_init = aux_decoder_zero_init
+        self.elic_proj_channels = elic_proj_channels
 
-        self.g_a = AnalysisTransform(ch_emd, channel, use_aux_encoder)
+        self.g_a = AnalysisTransform(ch_emd, channel, use_aux_encoder, elic_proj_channels)
         self.g_s = SynthesisTransform(channel, channel_out)
         self.h_a = HyperAnalysis(channel)
         self.h_s = HyperSynthesis(channel)
@@ -261,8 +265,7 @@ class LatentCodec(nn.Module):
 
         self.apply(self._init_weights)
 
-        if self.use_aux_decoder:
-            # Zero-init aux decoder's final conv to prevent shortcut domination
+        if self.use_aux_decoder and self.aux_decoder_zero_init:
             nn.init.constant_(self.aux.block[-1].weight, 0)
             nn.init.constant_(self.aux.block[-1].bias, 0)
 

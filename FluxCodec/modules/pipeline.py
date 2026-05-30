@@ -123,7 +123,6 @@ class FluxCodecPipeline(nn.Module):
 
     # ==================== Utility Methods ====================
  
-    @torch.no_grad()
     def encode_images(self, x01: torch.Tensor) -> Tuple[torch.Tensor, dict]:
         """Encode [0,1] image to latent with padding alignment."""
         h, w = x01.shape[-2], x01.shape[-1]
