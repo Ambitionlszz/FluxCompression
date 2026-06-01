@@ -67,6 +67,13 @@ def parse_args():
     parser.add_argument("--gradient_accumulation_steps", type=int, default=1)
 
     parser.add_argument("--train_schedule_steps", type=int, default=100)
+    parser.add_argument("--train_timestep_mode", type=str, default="infer_schedule",
+                        choices=["infer_schedule", "fixed", "random"],
+                        help="Training timestep sampling. infer_schedule samples only timesteps used by inference.")
+    parser.add_argument("--train_infer_steps", type=int, default=4,
+                        help="Inference-step count whose schedule is used when train_timestep_mode is infer_schedule/fixed.")
+    parser.add_argument("--fixed_timestep_index", type=int, default=0,
+                        help="Index into inference schedule[:-1] when train_timestep_mode=fixed.")
     parser.add_argument("--guidance", type=float, default=1.0)
 
     # Loss weights
@@ -141,6 +148,14 @@ def find_latest_checkpoint(output_dir: str, pattern: str) -> str | None:
     return ckpts[-1] if ckpts else None
 
 
+def _extract_codec_state(ckpt: dict) -> dict:
+    if isinstance(ckpt.get("codec"), dict):
+        return ckpt["codec"]
+    if isinstance(ckpt.get("state_dict"), dict):
+        return ckpt["state_dict"]
+    return ckpt
+
+
 def build_checkpoint_state(
     global_step,
     current_epoch,
@@ -203,6 +218,11 @@ def main():
             name_parts.append("ema")
         else:
             name_parts.append("noema")
+        name_parts.append(f"t{args.train_timestep_mode}")
+        if args.train_timestep_mode in {"infer_schedule", "fixed"}:
+            name_parts.append(f"i{args.train_infer_steps}")
+        if args.train_timestep_mode == "fixed":
+            name_parts.append(f"ti{args.fixed_timestep_index}")
         if not args.use_aux_encoder:
             name_parts.append("noauxe")
         if not args.use_aux_decoder:
@@ -264,7 +284,7 @@ def main():
     codec = build_codec(args)
     if args.codec_ckpt:
         ckpt = torch.load(args.codec_ckpt, map_location="cpu")
-        state = ckpt.get("state_dict", ckpt)
+        state = _extract_codec_state(ckpt)
         codec.load_state_dict(state, strict=False)
 
     # ELIC Auxiliary Encoder
@@ -328,6 +348,7 @@ def main():
         accelerator=accelerator,
         output_dir=run_dir if run_dir else args.output_dir,
         eval_batches=args.eval_batches,
+        infer_steps=args.train_infer_steps,
     )
 
     # Trainable parameters: codec + FLUX LoRA + AE LoRA
@@ -421,6 +442,11 @@ def main():
             print(f"AE Encoder LoRA injected layers: {ae_encoder_lora_stats.injected_layers}")
             print(f"AE Encoder LoRA trainable params: {ae_encoder_lora_stats.trainable_params}")
         print(f"Codec trainable params: {total_codec}")
+        print(
+            f"Train timestep mode: {args.train_timestep_mode} "
+            f"(train_schedule_steps={args.train_schedule_steps}, train_infer_steps={args.train_infer_steps}, "
+            f"fixed_timestep_index={args.fixed_timestep_index})"
+        )
         d3_weight = args.d3_dists if args.d3_metric == "dists" else args.d3_clip
         print(f"Stage1 d3 metric: {args.d3_metric} (weight={d3_weight})")
 
@@ -432,7 +458,13 @@ def main():
         for batch in train_loader:
             with accelerator.accumulate(pipeline.flux):
                 with accelerator.autocast():
-                    out = pipeline.forward_stage1_train(batch, train_schedule_steps=args.train_schedule_steps)
+                    out = pipeline.forward_stage1_train(
+                        batch,
+                        train_schedule_steps=args.train_schedule_steps,
+                        timestep_mode=args.train_timestep_mode,
+                        train_infer_steps=args.train_infer_steps,
+                        fixed_timestep_index=args.fixed_timestep_index,
+                    )
                     loss_dict = criterion(batch, out["x_hat"], out["likelihoods"])
                     loss = loss_dict["loss"]
 

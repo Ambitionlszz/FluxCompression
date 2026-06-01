@@ -22,10 +22,11 @@ class Stage1Evaluator:
     Stage1 Training Evaluator.
     """
     
-    def __init__(self, output_dir: str, eval_batches: int = 5, accelerator=None):
+    def __init__(self, output_dir: str, eval_batches: int = 5, accelerator=None, infer_steps: int = 4):
         self.output_dir = output_dir
         self.eval_batches = eval_batches
         self.accelerator = accelerator if accelerator is not None else SimpleNamespace(is_main_process=True)
+        self.infer_steps = infer_steps
         
         # Lazy initialized metrics
         self._lpips_metric = None
@@ -49,7 +50,7 @@ class Stage1Evaluator:
         global_step: int,
     ) -> Dict[str, float]:
         """
-        Perform model evaluation (4-step multistep denoise + entropy coding).
+        Perform model evaluation with entropy coding.
         """
         pipeline.codec.eval()
         pipeline.flux.eval()
@@ -66,7 +67,7 @@ class Stage1Evaluator:
         # Create evaluation image directory
         if self.accelerator.is_main_process:
             eval_image_dir = self._get_eval_image_dir(global_step)
-            print(f"Saving multistep evaluation images to: {eval_image_dir}")
+            print(f"Saving {self.infer_steps}-step evaluation images to: {eval_image_dir}")
             ensure_dir(eval_image_dir)
  
         # Randomly select batch indices to save
@@ -80,8 +81,11 @@ class Stage1Evaluator:
                 break
             
             with self.accelerator.autocast():
-                # Multistep inference mode
-                out = pipeline.forward_stage1_infer(batch, infer_steps=4, do_entropy_coding=True)
+                out = pipeline.forward_stage1_infer(
+                    batch,
+                    infer_steps=self.infer_steps,
+                    do_entropy_coding=True,
+                )
                 loss_dict = self._compute_multistep_metrics(batch, out)
  
             bs = batch.shape[0]
@@ -104,7 +108,7 @@ class Stage1Evaluator:
     
     def _get_eval_image_dir(self, global_step: int) -> str:
         """Get evaluation image save directory."""
-        subdir = f"eval_images_multistep/step_{global_step:08d}"
+        subdir = f"eval_images_{self.infer_steps}step/step_{global_step:08d}"
         return os.path.join(self.output_dir, subdir)
      
     def _sample_batch_indices(self, total_batches: int, n_samples: int = 5) -> set:
@@ -167,7 +171,7 @@ class Stage1Evaluator:
         grid = make_grid(comparison, nrow=n_images, padding=2, pad_value=1.0)
          
         # Generate filename
-        filename = f"batch_{batch_idx:03d}_multistep_comparison.png"
+        filename = f"batch_{batch_idx:03d}_{self.infer_steps}step_comparison.png"
         save_path = os.path.join(save_dir, filename)
          
         # Save image

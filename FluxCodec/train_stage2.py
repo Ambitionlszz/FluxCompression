@@ -83,6 +83,13 @@ def parse_args():
 
     # FLUX denoise
     p.add_argument("--train_schedule_steps", type=int, default=100)
+    p.add_argument("--train_timestep_mode", type=str, default="infer_schedule",
+                   choices=["infer_schedule", "fixed", "random"],
+                   help="Training timestep sampling. infer_schedule samples only timesteps used by inference.")
+    p.add_argument("--train_infer_steps", type=int, default=4,
+                   help="Inference-step count whose schedule is used when train_timestep_mode is infer_schedule/fixed.")
+    p.add_argument("--fixed_timestep_index", type=int, default=0,
+                   help="Index into inference schedule[:-1] when train_timestep_mode=fixed.")
     p.add_argument("--guidance", type=float, default=1.0)
 
     # Loss weights (StableCodec structure: R + λD)
@@ -260,6 +267,11 @@ def main():
             name_parts.append("ema")
         else:
             name_parts.append("noema")
+        name_parts.append(f"t{args.train_timestep_mode}")
+        if args.train_timestep_mode in {"infer_schedule", "fixed"}:
+            name_parts.append(f"i{args.train_infer_steps}")
+        if args.train_timestep_mode == "fixed":
+            name_parts.append(f"ti{args.fixed_timestep_index}")
         if not args.use_aux_encoder:
             name_parts.append("noauxe")
         if not args.use_aux_decoder:
@@ -368,6 +380,7 @@ def main():
         accelerator=accelerator,
         output_dir=run_dir if run_dir else args.output_dir,
         eval_batches=args.eval_batches,
+        infer_steps=args.train_infer_steps,
     )
 
     # ========== Optimizers ==========
@@ -474,6 +487,11 @@ def main():
         if ae_encoder_lora_stats is not None:
             print(f"AE Encoder LoRA: {ae_encoder_lora_stats.injected_layers} layers, {ae_encoder_lora_stats.trainable_params} params")
         print(f"Codec trainable: {total_codec} | Disc trainable: {disc_params}")
+        print(
+            f"Train timestep mode: {args.train_timestep_mode} "
+            f"(train_schedule_steps={args.train_schedule_steps}, train_infer_steps={args.train_infer_steps}, "
+            f"fixed_timestep_index={args.fixed_timestep_index})"
+        )
         print(f"Gen LR: {args.lr} | Disc LR: {args.lr_disc}")
         print(f"Loss: R*{args.lambda_rate} + L2*{args.lambda_l2} + LPIPS*{args.lambda_lpips} "
               f"+ DISTS*{args.lambda_dists} + GAN*{args.lambda_gan}")
@@ -499,7 +517,13 @@ def main():
             with accelerator.accumulate(*l_acc):
                 with accelerator.autocast():
                     # Forward pass
-                    out = pipeline.forward_stage1_train(batch, train_schedule_steps=args.train_schedule_steps)
+                    out = pipeline.forward_stage1_train(
+                        batch,
+                        train_schedule_steps=args.train_schedule_steps,
+                        timestep_mode=args.train_timestep_mode,
+                        train_infer_steps=args.train_infer_steps,
+                        fixed_timestep_index=args.fixed_timestep_index,
+                    )
                     x = batch.detach().float()
                     x_hat = out["x_hat"].float()
 

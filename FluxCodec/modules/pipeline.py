@@ -323,9 +323,47 @@ class FluxCodecPipeline(nn.Module):
 
         return (out_accum / weight_accum.clamp_min(1e-6)).to(z_tcm.dtype)
 
+    def _sample_training_timesteps(
+        self,
+        z_tokens: torch.Tensor,
+        batch_size: int,
+        train_schedule_steps: int,
+        timestep_mode: str,
+        train_infer_steps: int,
+        fixed_timestep_index: int,
+    ) -> torch.Tensor:
+        if timestep_mode == "random":
+            schedule = get_schedule(train_schedule_steps, z_tokens.shape[1])
+            schedule_tensor = torch.tensor(schedule, dtype=z_tokens.dtype, device=z_tokens.device)
+            step_idx = torch.randint(0, train_schedule_steps, (batch_size,), device=z_tokens.device)
+            return schedule_tensor[step_idx]
+
+        if timestep_mode not in {"infer_schedule", "fixed"}:
+            raise ValueError(f"Unsupported timestep_mode: {timestep_mode}")
+
+        schedule = get_schedule(train_infer_steps, z_tokens.shape[1])
+        # During inference denoise() calls the model at schedule[:-1], not at the terminal zero.
+        schedule_tensor = torch.tensor(schedule[:-1], dtype=z_tokens.dtype, device=z_tokens.device)
+        if schedule_tensor.numel() == 0:
+            raise ValueError(f"train_infer_steps must be positive, got {train_infer_steps}")
+
+        if timestep_mode == "fixed":
+            idx = max(0, min(int(fixed_timestep_index), schedule_tensor.numel() - 1))
+            return schedule_tensor[idx].expand(batch_size)
+
+        step_idx = torch.randint(0, schedule_tensor.numel(), (batch_size,), device=z_tokens.device)
+        return schedule_tensor[step_idx]
+
     # ==================== Training Interface ====================
  
-    def forward_stage1_train(self, x01: torch.Tensor, train_schedule_steps: int) -> dict:
+    def forward_stage1_train(
+        self,
+        x01: torch.Tensor,
+        train_schedule_steps: int,
+        timestep_mode: str = "infer_schedule",
+        train_infer_steps: int = 4,
+        fixed_timestep_index: int = 0,
+    ) -> dict:
         """
         Training forward pass:
         AE encode -> ELIC -> LatentCodec -> FLUX single-step denoise -> AE decode
@@ -347,10 +385,14 @@ class FluxCodecPipeline(nn.Module):
         # 4. FLUX Denoise Preparation
         z_tokens, z_ids = self._latent_to_tokens(z_tcm)
  
-        schedule = get_schedule(train_schedule_steps, z_tokens.shape[1])
-        schedule_tensor = torch.tensor(schedule, dtype=z_tokens.dtype, device=device)
-        step_idx = torch.randint(0, train_schedule_steps, (batch_size,), device=device)
-        timesteps = schedule_tensor[step_idx]
+        timesteps = self._sample_training_timesteps(
+            z_tokens=z_tokens,
+            batch_size=batch_size,
+            train_schedule_steps=train_schedule_steps,
+            timestep_mode=timestep_mode,
+            train_infer_steps=train_infer_steps,
+            fixed_timestep_index=fixed_timestep_index,
+        )
  
         ctx, ctx_ids = self.get_text_context(batch_size=batch_size, device=device)
         guidance_vec = torch.full(
@@ -453,4 +495,3 @@ class FluxCodecPipeline(nn.Module):
                     total_bytes[i] += 12.0
 
         return {"x_hat": x_hat01, "bytes": total_bytes}
-

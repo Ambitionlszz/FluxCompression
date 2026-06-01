@@ -1,8 +1,10 @@
 """
 ELIC Auxiliary Encoder Loader.
 """
-import sys
 import os
+import sys
+from pathlib import Path
+
 import torch
 import torch.nn as nn
 
@@ -70,17 +72,50 @@ def _log_g_a_load_check(model: nn.Module, state_dict: dict, max_examples: int = 
         print(f"[ELIC] Verified g_a weights: {matched}/{total} tensors matched checkpoint shapes")
 
 
+def _load_elic_class():
+    repo_root = Path(__file__).resolve().parent.parent
+    candidates = (
+        repo_root / "DiT-IC",
+        repo_root / "StableCodec",
+        Path("/data2/luosheng/code/DiT-IC"),
+        Path("/data2/luosheng/code/flux2/DiT-IC"),
+    )
+
+    tried = []
+    for root in candidates:
+        tried.append(str(root))
+        if not root.exists():
+            continue
+        root_str = str(root)
+        if root_str not in sys.path:
+            sys.path.insert(0, root_str)
+        for name in list(sys.modules):
+            if name == "ELIC" or name.startswith("ELIC."):
+                del sys.modules[name]
+        try:
+            from ELIC.elic_official import ELIC  # type: ignore
+            print(f"[ELIC] Imported ELIC from {root}")
+            return ELIC
+        except ModuleNotFoundError:
+            try:
+                from ELIC.model.elic_official import ELIC  # type: ignore
+                print(f"[ELIC] Imported ELIC from {root}")
+                return ELIC
+            except ModuleNotFoundError:
+                continue
+
+    raise ModuleNotFoundError(
+        "Could not import ELIC model definition from local repo. "
+        "The checkpoint file only contains weights, so the ELIC Python source is still required. "
+        f"Tried: {', '.join(tried)}"
+    )
+
+
 def load_elic_encoder(elic_ckpt: str, device: torch.device = torch.device("cpu")) -> nn.Module:
     """
     Load ELIC model and extract its g_a as the auxiliary encoder.
     """
-    # Infer DiT-IC directory from checkpoint path
-    ckpt_abs = os.path.abspath(elic_ckpt)
-    dit_ic_dir = os.path.dirname(os.path.dirname(ckpt_abs))  # checkpoints → DiT-IC
-    if dit_ic_dir not in sys.path:
-        sys.path.insert(0, dit_ic_dir)
-
-    from ELIC.elic_official import ELIC
+    ELIC = _load_elic_class()
 
     model = ELIC()
     if os.path.exists(elic_ckpt):
@@ -100,4 +135,3 @@ def load_elic_encoder(elic_ckpt: str, device: torch.device = torch.device("cpu")
     aux_encoder.requires_grad_(False)
     aux_encoder.to(device)
     return aux_encoder
-

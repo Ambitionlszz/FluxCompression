@@ -105,6 +105,10 @@ def parse_args() -> argparse.Namespace:
     p.add_argument("--num_workers", type=int, default=4)
     p.add_argument("--grad_clip", type=float, default=1.0)
     p.add_argument("--train_schedule_steps", type=int, default=100)
+    p.add_argument("--train_timestep_mode", type=str, default="infer_schedule",
+                   choices=["infer_schedule", "fixed", "random"])
+    p.add_argument("--train_infer_steps", type=int, default=4)
+    p.add_argument("--fixed_timestep_index", type=int, default=0)
     p.add_argument("--guidance", type=float, default=1.0)
     p.add_argument("--gan_loss_type", type=str, default="multilevel_sigmoid_s")
     p.add_argument("--disc_cv_type", type=str, default="dinov2_reg")
@@ -176,6 +180,9 @@ def build_train_options(
         "max_steps": max_steps if max_steps is not None else args.steps_per_trial,
         "grad_clip": args.grad_clip,
         "train_schedule_steps": args.train_schedule_steps,
+        "train_timestep_mode": args.train_timestep_mode,
+        "train_infer_steps": args.train_infer_steps,
+        "fixed_timestep_index": args.fixed_timestep_index,
         "guidance": args.guidance,
         "gan_loss_type": args.gan_loss_type,
         "disc_cv_type": args.disc_cv_type,

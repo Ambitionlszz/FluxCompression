@@ -85,9 +85,15 @@ class Upsample(nn.Module):
 
 class AnalysisTransform(nn.Module):
     """
-    g_a: 4x downsampling analysis transform.
+    g_a: 2x downsampling from the FLUX AE latent grid.
     """
-    def __init__(self, ch_emd=128, channel=320, use_aux_encoder=True, elic_proj_channels=64):
+    def __init__(
+        self,
+        ch_emd=128,
+        channel=320,
+        use_aux_encoder=True,
+        elic_proj_channels=64,
+    ):
         super().__init__()
         self.use_aux_encoder = use_aux_encoder
         self.elic_proj_channels = elic_proj_channels
@@ -105,7 +111,7 @@ class AnalysisTransform(nn.Module):
         self.analysis_transform = nn.Sequential(
             DepthConvBlock(in_channels, in_channels),
             DepthConvBlock(in_channels, in_channels),
-            Downsample(in_channels, channel),      # 1x down -> (16x16 -> 8x8)
+            Downsample(in_channels, channel),
             DepthConvBlock(channel, channel),
             DepthConvBlock(channel, channel),
         )
@@ -126,13 +132,13 @@ class AnalysisTransform(nn.Module):
 
 
 class SynthesisTransform(nn.Module):
-    """g_s: 4x upsampling transform."""
+    """g_s: 2x upsampling back to the FLUX AE latent grid."""
     def __init__(self, channel=320, channel_out=128):
         super().__init__()
         self.synthesis_transform = nn.Sequential(
             DepthConvBlock(channel, 320),
             DepthConvBlock(320, 320),
-            Upsample(320, 320),            # 1x up -> (8x8 -> 16x16)
+            Upsample(320, 320),
             DepthConvBlock(320, 320),
             nn.Conv2d(320, channel_out, kernel_size=3, padding=1),
         )
@@ -142,13 +148,13 @@ class SynthesisTransform(nn.Module):
 
 
 class AuxDecoder(nn.Module):
-    """Auxiliary decoder with 4x upsampling."""
+    """Auxiliary decoder for the residual latent."""
     def __init__(self, ch_emd=128, channel=320):
         super().__init__()
         self.block = nn.Sequential(
             DepthConvBlock(channel, 320),
             DepthConvBlock(320, 320),
-            Upsample(320, 320),            # 1x up -> (8x8 -> 16x16)
+            Upsample(320, 320),
             DepthConvBlock(320, 320),
             nn.Conv2d(320, ch_emd, kernel_size=3, padding=1),
         )
@@ -229,7 +235,8 @@ class LatentCodec(nn.Module):
     def __init__(self, ch_emd=128, channel=320, channel_out=128,
                  num_slices=5, max_support_slices=5,
                  use_aux_encoder=True, use_aux_decoder=True,
-                 aux_decoder_zero_init=False, elic_proj_channels=64, **kwargs):
+                 aux_decoder_zero_init=False, elic_proj_channels=64,
+                 **kwargs):
         super().__init__()
 
         M = channel
@@ -241,7 +248,9 @@ class LatentCodec(nn.Module):
         self.aux_decoder_zero_init = aux_decoder_zero_init
         self.elic_proj_channels = elic_proj_channels
 
-        self.g_a = AnalysisTransform(ch_emd, channel, use_aux_encoder, elic_proj_channels)
+        self.g_a = AnalysisTransform(
+            ch_emd, channel, use_aux_encoder, elic_proj_channels
+        )
         self.g_s = SynthesisTransform(channel, channel_out)
         self.h_a = HyperAnalysis(channel)
         self.h_s = HyperSynthesis(channel)
@@ -360,10 +369,10 @@ class LatentCodec(nn.Module):
         return self.unsequeeze_with_mask(latent_sq_hat + means_sq, mask)
 
     def _target_latent_size(self, size):
-        # g_a maps latent size L to ceil(L / 2). h_a/h_s then require that
-        # y size to be divisible by 4 so the hyperprior returns the same size.
-        for target in range(size, size + 8):
-            if ((target + 1) // 2) % 4 == 0:
+        # h_a/h_s down/up-sample y by 4x, so y must be divisible by 4.
+        for target in range(size, size + 16):
+            y_size = (target + 1) // 2
+            if y_size % 4 == 0:
                 return target
         raise RuntimeError(f"Could not find aligned latent size for {size}")
 

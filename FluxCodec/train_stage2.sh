@@ -28,6 +28,9 @@ accelerate launch \
     --lr_disc 2e-5 \
     --grad_clip 1.0 \
     --train_schedule_steps 100 \
+    --train_timestep_mode infer_schedule \
+    --train_infer_steps 4 \
+    --fixed_timestep_index 0 \
     --guidance 1.0 \
     --lambda_rate 0.5 \
     --lambda_l2 1.0 \
