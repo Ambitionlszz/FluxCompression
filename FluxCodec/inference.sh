@@ -6,9 +6,9 @@ MIXED_PRECISION=${MIXED_PRECISION:-bf16}
 MAIN_PORT=${MAIN_PORT:-29501}
 CUDA_DEVICES=${CUDA_DEVICES:-1}
 
-INPUT_DIRS=${INPUT_DIRS:-/data2/luosheng/data/Datasets/Kodak,/data2/luosheng/data/Datasets/DIV2K_valid_HR}
+INPUT_DIRS=${INPUT_DIRS:-/data2/luosheng/data/Datasets/Kodak}
 INPUT_DIRS=${INPUT_DIRS//,/ }
-CHECKPOINT=${CHECKPOINT:-/data2/luosheng/code/flux2/FluxCodec/outputs/fluxcodec_stage1/run_20260526_080302/checkpoints/stage1_step_00280000.pt}
+CHECKPOINT=${CHECKPOINT:-/data2/luosheng/code/flux2/FluxCodec/outputs/fluxcodec_stage1/run_20260601_081705_lr5e-5_ld0.5_noael_ema_trandom_noauxe/checkpoints/stage1_best.pt}
 
 USE_GRADIENT_CHECKPOINTING=${USE_GRADIENT_CHECKPOINTING:-false}
 COLOR_FIX=${COLOR_FIX:-false}
@@ -126,9 +126,9 @@ print(suffix)
 ")
   
   if [ "${NUM_DATASETS}" -eq 1 ]; then
-    NEW_DIR_NAME="infer_${DATASET_NAME}_bpp${AVG_BPP}${AUX_SUFFIX}"
+    NEW_DIR_NAME="infer_${DATASET_NAME}_${TIMESTAMP}_bpp${AVG_BPP}${AUX_SUFFIX}"
   else
-    NEW_DIR_NAME="infer_multi_datasets_bpp${AVG_BPP}${AUX_SUFFIX}"
+    NEW_DIR_NAME="infer_multi_datasets_${TIMESTAMP}_bpp${AVG_BPP}${AUX_SUFFIX}"
   fi
   
   NEW_OUTPUT_DIR="$(dirname "${OUTPUT_DIR}")/${NEW_DIR_NAME}"

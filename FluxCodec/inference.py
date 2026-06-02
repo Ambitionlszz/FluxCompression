@@ -126,6 +126,8 @@ def parse_args():
     parser.add_argument("--use_aux_decoder", type=int, default=1, help="1 to enable AuxDecoder residual, 0 to disable")
     parser.add_argument("--aux_decoder_zero_init", type=int, default=0, help="Only affects randomly initialized AuxDecoder before checkpoint loading")
     parser.add_argument("--elic_proj_channels", type=int, default=64, help="ELIC feature projection channels (320 -> elic_proj_channels)")
+    parser.add_argument("--codec_analysis_channels", type=int, default=0,
+                        help="Internal g_a analysis width. 0 auto-detects from checkpoint.")
 
     parser.add_argument("--color_fix", action="store_true", help="Apply StableCodec color fix strategy")
     parser.add_argument("--use_ema_weights", type=int, default=1, help="1 to load EMA weights from checkpoint when available")
@@ -159,6 +161,7 @@ def build_codec(args):
         use_aux_decoder=bool(args.use_aux_decoder),
         aux_decoder_zero_init=bool(args.aux_decoder_zero_init),
         elic_proj_channels=args.elic_proj_channels,
+        analysis_channels=args.codec_analysis_channels or None,
     )
 
 
@@ -185,6 +188,13 @@ def _infer_codec_channel(codec_sd: dict[str, torch.Tensor], default: int) -> int
 
 def _infer_elic_proj_channels(codec_sd: dict[str, torch.Tensor], default: int = 64) -> int:
     weight = codec_sd.get("g_a.aux_proj.weight")
+    if weight is not None:
+        return int(weight.shape[0])
+    return int(default)
+
+
+def _infer_codec_analysis_channels(codec_sd: dict[str, torch.Tensor], default: int = 0) -> int:
+    weight = codec_sd.get("g_a.fuse.weight")
     if weight is not None:
         return int(weight.shape[0])
     return int(default)
@@ -236,6 +246,7 @@ def apply_checkpoint_config(args, ckpt: dict):
     args.elic_proj_channels = int(
         _ckpt_arg(ckpt_args, "elic_proj_channels", _infer_elic_proj_channels(codec_sd, args.elic_proj_channels))
     )
+    args.codec_analysis_channels = _infer_codec_analysis_channels(codec_sd, args.codec_analysis_channels)
 
     args.lora_rank = int(_ckpt_arg(ckpt_args, "lora_rank", infer_lora_rank(ckpt["flux_lora"], "FLUX")))
     args.lora_alpha = float(_ckpt_arg(ckpt_args, "lora_alpha", args.lora_rank))
@@ -363,6 +374,7 @@ def main():
             f"model_name={args.model_name}, guidance={args.guidance}, "
             f"codec_ch_emd={args.codec_ch_emd}, codec_channel={args.codec_channel}, "
             f"codec_channel_out={args.codec_channel_out}, codec_num_slices={args.codec_num_slices}, "
+            f"elic_proj_channels={args.elic_proj_channels}, codec_analysis_channels={args.codec_analysis_channels}, "
             f"use_aux_encoder={bool(args.use_aux_encoder)}, use_aux_decoder={bool(args.use_aux_decoder)}, "
             f"use_ae_lora={has_ae_decoder_lora}, use_ae_encoder_lora={has_ae_encoder_lora}, "
             f"lora_rank={args.lora_rank}, lora_alpha={args.lora_alpha}, "

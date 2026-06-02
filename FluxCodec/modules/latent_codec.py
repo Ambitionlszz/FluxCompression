@@ -93,6 +93,7 @@ class AnalysisTransform(nn.Module):
         channel=320,
         use_aux_encoder=True,
         elic_proj_channels=64,
+        analysis_channels=None,
     ):
         super().__init__()
         self.use_aux_encoder = use_aux_encoder
@@ -106,12 +107,15 @@ class AnalysisTransform(nn.Module):
             self.aux_proj = None
             in_channels = ch_emd
 
-        self.fuse = nn.Conv2d(in_channels, in_channels, kernel_size=3, padding=1)  # channel fusion
+        if analysis_channels is None:
+            analysis_channels = in_channels
+
+        self.fuse = nn.Conv2d(in_channels, analysis_channels, kernel_size=3, padding=1)  # channel fusion
 
         self.analysis_transform = nn.Sequential(
-            DepthConvBlock(in_channels, in_channels),
-            DepthConvBlock(in_channels, in_channels),
-            Downsample(in_channels, channel),
+            DepthConvBlock(analysis_channels, analysis_channels),
+            DepthConvBlock(analysis_channels, analysis_channels),
+            Downsample(analysis_channels, channel),
             DepthConvBlock(channel, channel),
             DepthConvBlock(channel, channel),
         )
@@ -236,6 +240,7 @@ class LatentCodec(nn.Module):
                  num_slices=5, max_support_slices=5,
                  use_aux_encoder=True, use_aux_decoder=True,
                  aux_decoder_zero_init=False, elic_proj_channels=64,
+                 analysis_channels=None,
                  **kwargs):
         super().__init__()
 
@@ -247,9 +252,10 @@ class LatentCodec(nn.Module):
         self.use_aux_decoder = use_aux_decoder
         self.aux_decoder_zero_init = aux_decoder_zero_init
         self.elic_proj_channels = elic_proj_channels
+        self.analysis_channels = analysis_channels
 
         self.g_a = AnalysisTransform(
-            ch_emd, channel, use_aux_encoder, elic_proj_channels
+            ch_emd, channel, use_aux_encoder, elic_proj_channels, analysis_channels
         )
         self.g_s = SynthesisTransform(channel, channel_out)
         self.h_a = HyperAnalysis(channel)

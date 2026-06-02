@@ -26,7 +26,7 @@ accelerate launch \
     --lr 5e-5 \
     --grad_clip 1.0 \
     --train_schedule_steps 100 \
-    --train_timestep_mode infer_schedule \
+    --train_timestep_mode random \
     --train_infer_steps 4 \
     --fixed_timestep_index 0 \
     --guidance 1.0 \
@@ -37,9 +37,9 @@ accelerate launch \
     --d3_dists 0.1 \
     --d3_clip 0.1 \
     --clip_ckpt "$CLIP_CKPT" \
-    --lora_rank 64 \
-    --lora_alpha 64.0 \
-    --use_ae_lora 1 \
+    --lora_rank 32 \
+    --lora_alpha 32.0 \
+    --use_ae_lora 0 \
     --ae_lora_rank 32 \
     --ae_lora_alpha 32.0 \
     --use_ae_encoder_lora 0 \
@@ -51,8 +51,8 @@ accelerate launch \
     --codec_channel 320 \
     --codec_channel_out 128 \
     --codec_num_slices 5 \
-    --use_aux_encoder 1 \
-    --use_aux_decoder 1 \
+    --use_aux_encoder 0 \
+    --use_aux_decoder 0 \
     --aux_decoder_zero_init 0 \
     --elic_proj_channels 64 \
     --log_every 50 \
